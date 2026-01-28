@@ -1,0 +1,13 @@
+# Core Dependencies
+fr24sdk
+numpy
+pandas
+
+# PostgreSQL Database
+psycopg2-binary
+
+# Machine Learning
+torch
+xgboost
+scikit-learn
+joblib

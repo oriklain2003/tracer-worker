@@ -1,0 +1,10 @@
+# PostgreSQL Monitor Requirements
+# Install with: pip install -r requirements_postgres.txt
+
+# PostgreSQL adapter
+psycopg2-binary>=2.9.9
+
+# Existing dependencies (if not already installed)
+fr24sdk
+
+numpy

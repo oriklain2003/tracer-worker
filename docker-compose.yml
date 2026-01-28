@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  monitor:
+    build: .
+    image: onyx-cortex-runner:latest
+    container_name: flight-monitor
+    restart: unless-stopped
+    environment:
+      # PostgreSQL Configuration
+      - PG_HOST=${PG_HOST}
+      - PG_PORT=${PG_PORT:-5432}
+      - PG_DATABASE=${PG_DATABASE}
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_SCHEMA=${PG_SCHEMA:-live}
+    volumes:
+      # Mount logs directory for persistent logs
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
