@@ -229,45 +229,45 @@ class AnomalyPipeline:
         # --- Layer 1: Rule Engine ---
         t0 = time.time()
         if self.rule_engine:
-            try:
-                # Use the passed repository if available (e.g., InMemoryRepository for live context)
-                # We temporarily swap the repository in the engine
-                original_repo = self.rule_engine.repository
-                if repository:
-                    self.rule_engine.repository = repository
-                
-                rule_report = self.rule_engine.evaluate_track(flight_active, metadata=metadata)
-                
-                # Restore original repo
-                if repository:
-                    self.rule_engine.repository = original_repo
-                
-                # Parse results for summary
-                matched_rules = rule_report.get("matched_rules", [])
+            # try:
+            # Use the passed repository if available (e.g., InMemoryRepository for live context)
+            # We temporarily swap the repository in the engine
+            original_repo = self.rule_engine.repository
+            if repository:
+                self.rule_engine.repository = repository
+            
+            rule_report = self.rule_engine.evaluate_track(flight_active, metadata=metadata)
+            
+            # Restore original repo
+            if repository:
+                self.rule_engine.repository = original_repo
+            
+            # Parse results for summary
+            matched_rules = rule_report.get("matched_rules", [])
 
-                if matched_rules:
-                    status = "ANOMALY"
-                    is_anomaly_any = True
-                    summary_triggers.append("Rules")
-                    triggers_text = [r["name"] for r in matched_rules]
-                else:
-                    status = "NORMAL"
-                    triggers_text = []
+            if matched_rules:
+                status = "ANOMALY"
+                is_anomaly_any = True
+                summary_triggers.append("Rules")
+                triggers_text = [r["name"] for r in matched_rules]
+            else:
+                status = "NORMAL"
+                triggers_text = []
 
-                results["layer_1_rules"] = {
-                    "status": status,
-                    "triggers": triggers_text,
-                    "report": rule_report # Full detailed report
-                }
+            results["layer_1_rules"] = {
+                "status": status,
+                "triggers": triggers_text,
+                "report": rule_report # Full detailed report
+            }
                 
-            except Exception as e:
-                # Handle Unicode encoding issues in error messages
-                try:
-                    error_msg = str(e)
-                except UnicodeEncodeError:
-                    error_msg = repr(e)
-                results["layer_1_rules"] = {"error": error_msg, "status": "ERROR"}
-                print(f"  [!] Rule Engine Error: {error_msg}")
+            # except Exception as e:
+            #     # Handle Unicode encoding issues in error messages
+            #     try:
+            #         error_msg = str(e)
+            #     except UnicodeEncodeError:
+            #         error_msg = repr(e)
+            #     results["layer_1_rules"] = {"error": error_msg, "status": "ERROR"}
+            #     print(f"  [!] Rule Engine Error: {error_msg}")
         else:
                 results["layer_1_rules"] = {"status": "SKIPPED", "info": "Engine not loaded"}
         print(f"  [Timer] Rules: {time.time() - t0:.4f}s")

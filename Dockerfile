@@ -39,9 +39,9 @@ ENV PG_HOST="" \
     PG_PASSWORD="" \
     PG_SCHEMA="live"
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import psycopg2; psycopg2.connect('postgresql://\${PG_USER}:\${PG_PASSWORD}@\${PG_HOST}:\${PG_PORT}/\${PG_DATABASE}')" || exit 1
+# Add health check (runs every 2 minutes)
+HEALTHCHECK --interval=2m --timeout=10s --start-period=30s --retries=3 \
+    CMD python healthcheck.py || exit 1
 
-# Run the monitor
-CMD ["python", "monitor.py"]
+# Run the monitor with unbuffered output
+CMD ["python", "-u", "monitor.py"]

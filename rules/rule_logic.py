@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import logging
 
 import numpy as np
 
@@ -20,6 +21,16 @@ from core.geodesy import (
 from core.path_utils import resample_track_points, point_to_polyline_distance_nm
 from core.models import FlightTrack, RuleContext, RuleResult, TrackPoint
 from core.military_detection import is_military
+
+# Import PostgreSQL provider for loading learned behaviors
+try:
+    from pg_provider import get_connection
+    _PG_AVAILABLE = True
+except ImportError:
+    _PG_AVAILABLE = False
+    logging.warning("pg_provider not available, will use JSON files as fallback")
+
+logger = logging.getLogger(__name__)
 
 CONFIG = load_rule_config()
 RULES = CONFIG.get("rules", {})
@@ -109,6 +120,16 @@ _LEARNED_SID_CACHE: Optional[List[Dict[str, Any]]] = None
 _LEARNED_STAR_CACHE: Optional[List[Dict[str, Any]]] = None
 _LEARNED_TUBES_CACHE: Optional[List[Dict[str, Any]]] = None
 
+# Initialize PostgreSQL connection pool if available
+if _PG_AVAILABLE:
+    try:
+        from pg_provider import init_connection_pool
+        init_connection_pool()
+        logger.info("PostgreSQL connection pool initialized for learned behaviors")
+    except Exception as e:
+        logger.warning(f"Failed to initialize PostgreSQL connection pool: {e}")
+        _PG_AVAILABLE = False
+
 # Learned behavior configuration (optional - may not exist)
 LEARNED_BEHAVIOR_CFG = RULES.get("learned_behavior", {})
 _lb_turns_file = Path(LEARNED_BEHAVIOR_CFG.get("turns_file", "rules/learned_turns.json"))
@@ -141,11 +162,41 @@ def _load_learned_turns(refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _load_learned_sid(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load learned SID procedures from JSON file."""
+    """Load learned SID procedures from PostgreSQL (or JSON file as fallback)."""
     global _LEARNED_SID_CACHE
     if _LEARNED_SID_CACHE is not None and not refresh:
         return _LEARNED_SID_CACHE
     
+    # Try loading from PostgreSQL first
+    if _PG_AVAILABLE:
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, airport, type, centerline, width_nm, member_count, runway
+                        FROM learned_sids
+                        ORDER BY member_count DESC
+                    """)
+                    rows = cursor.fetchall()
+                    
+                    _LEARNED_SID_CACHE = []
+                    for row in rows:
+                        _LEARNED_SID_CACHE.append({
+                            "id": row[0],
+                            "airport": row[1],
+                            "type": row[2],
+                            "centerline": json.loads(row[3]) if isinstance(row[3], str) else row[3],
+                            "width_nm": row[4],
+                            "member_count": row[5],
+                            "runway": row[6]
+                        })
+                    
+                    logger.info(f"Loaded {len(_LEARNED_SID_CACHE)} SIDs from PostgreSQL")
+                    return _LEARNED_SID_CACHE
+        except Exception as e:
+            logger.warning(f"Failed to load SIDs from PostgreSQL, falling back to JSON: {e}")
+    
+    # Fallback to JSON file
     try:
         if LEARNED_SID_FILE.exists():
             with open(LEARNED_SID_FILE, "r", encoding="utf-8") as f:
@@ -160,11 +211,41 @@ def _load_learned_sid(refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _load_learned_star(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load learned STAR procedures from JSON file."""
+    """Load learned STAR procedures from PostgreSQL (or JSON file as fallback)."""
     global _LEARNED_STAR_CACHE
     if _LEARNED_STAR_CACHE is not None and not refresh:
         return _LEARNED_STAR_CACHE
     
+    # Try loading from PostgreSQL first
+    if _PG_AVAILABLE:
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, airport, type, centerline, width_nm, member_count, runway
+                        FROM learned_stars
+                        ORDER BY member_count DESC
+                    """)
+                    rows = cursor.fetchall()
+                    
+                    _LEARNED_STAR_CACHE = []
+                    for row in rows:
+                        _LEARNED_STAR_CACHE.append({
+                            "id": row[0],
+                            "airport": row[1],
+                            "type": row[2],
+                            "centerline": json.loads(row[3]) if isinstance(row[3], str) else row[3],
+                            "width_nm": row[4],
+                            "member_count": row[5],
+                            "runway": row[6]
+                        })
+                    
+                    logger.info(f"Loaded {len(_LEARNED_STAR_CACHE)} STARs from PostgreSQL")
+                    return _LEARNED_STAR_CACHE
+        except Exception as e:
+            logger.warning(f"Failed to load STARs from PostgreSQL, falling back to JSON: {e}")
+    
+    # Fallback to JSON file
     try:
         if LEARNED_STAR_FILE.exists():
             with open(LEARNED_STAR_FILE, "r", encoding="utf-8") as f:
@@ -184,7 +265,7 @@ LEARNED_TUBES_FILE = (_tubes_file if _tubes_file.is_absolute() else (PROJECT_ROO
 
 
 def _load_learned_tubes(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load learned tubes from JSON file."""
+    """Load learned tubes from JSON file and filter by OD pair member_count > 50."""
     global _LEARNED_TUBES_CACHE
     if _LEARNED_TUBES_CACHE is not None and not refresh:
         return _LEARNED_TUBES_CACHE
@@ -194,11 +275,32 @@ def _load_learned_tubes(refresh: bool = False) -> List[Dict[str, Any]]:
             with open(LEARNED_TUBES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 tubes = data.get("tubes", [])
-                # Convert geometry to tuple format for faster checking
+                
+                # Group tubes by OD pair and calculate total member_count
+                od_member_counts = defaultdict(int)
                 for tube in tubes:
-                    geom = tube.get("geometry", [])
-                    tube["geometry_tuples"] = [(pt[0], pt[1]) for pt in geom if len(pt) >= 2]
-                _LEARNED_TUBES_CACHE = tubes
+                    origin = tube.get("origin")
+                    destination = tube.get("destination")
+                    member_count = tube.get("member_count", 0)
+                    
+                    # Create OD pair key (handle None values)
+                    od_key = (origin, destination)
+                    od_member_counts[od_key] += member_count
+                
+                # Filter tubes: only keep those from OD pairs with total member_count > 50
+                filtered_tubes = []
+                for tube in tubes:
+                    origin = tube.get("origin")
+                    destination = tube.get("destination")
+                    od_key = (origin, destination)
+                    
+                    if od_member_counts[od_key] > 80:
+                        # Convert geometry to tuple format for faster checking
+                        geom = tube.get("geometry", [])
+                        tube["geometry_tuples"] = [(pt[0], pt[1]) for pt in geom if len(pt) >= 2]
+                        filtered_tubes.append(tube)
+                
+                _LEARNED_TUBES_CACHE = filtered_tubes
         else:
             _LEARNED_TUBES_CACHE = []
     except Exception as e:
@@ -207,22 +309,19 @@ def _load_learned_tubes(refresh: bool = False) -> List[Dict[str, Any]]:
     return _LEARNED_TUBES_CACHE
 
 
+
 def _get_tubes_for_od(
     origin: Optional[str],
     destination: Optional[str],
     all_tubes: List[Dict[str, Any]]
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
-    Filter tubes to only those that the flight could belong to.
+    Filter tubes to only those that match BOTH origin AND destination exactly.
     
-    Logic for flight X -> Y:
-    - Prefer exact match: X -> Y
-    - If none found, include: X -> None/UNK (same origin, unknown dest)
-    - If none found, include: None/UNK -> Y (unknown origin, same dest)
-    - If still none, fall back to generic UNK -> UNK tubes
-    
-    If flight has NO origin AND NO destination:
-    - Fallback to all tubes
+    Logic:
+    - REQUIRES both origin AND destination to be provided
+    - ONLY returns tubes where BOTH origin AND destination match exactly
+    - If either origin or destination is missing, returns empty list
     
     Args:
         origin: Origin airport code (or None)
@@ -231,59 +330,40 @@ def _get_tubes_for_od(
         
     Returns:
         Tuple of (filtered_tubes, used_od_filter)
-        - filtered_tubes: Tubes matching the O/D (or all tubes if no match)
+        - filtered_tubes: Tubes matching BOTH O and D exactly (or empty if no match)
         - used_od_filter: True if O/D filtering was applied
     """
-    # No O/D info at all - fallback to all tubes
-    if origin is None and destination is None:
-        return all_tubes, False
-    
     # Normalize None/"UNK"/empty strings
     def normalize(val):
         if not val or val == "UNK":
             return None
         return val
     
-    # Try exact match first
+    # Normalize inputs
+    origin = normalize(origin)
+    destination = normalize(destination)
+    
+    # REQUIRE both origin AND destination
+    if origin is None or destination is None:
+        return [], False
+    
+    # Find tubes with EXACT match on BOTH origin AND destination
     exact_matches = []
     for tube in all_tubes:
         tube_origin = normalize(tube.get("origin"))
         tube_dest = normalize(tube.get("destination"))
         
-        # Exact match: both O and D match (ignoring None)
-        origin_match = (origin is None) or (tube_origin is None) or (origin == tube_origin)
-        dest_match = (destination is None) or (tube_dest is None) or (destination == tube_dest)
-        
-        # Prefer tubes with known O/D that match
-        if origin_match and dest_match:
-            # Prioritize tubes with matching non-None values
-            if (tube_origin == origin and tube_dest == destination):
-                # Exact match - highest priority
-                exact_matches.append((tube, 0))
-            elif (tube_origin == origin) or (tube_dest == destination):
-                # Partial match - medium priority
-                exact_matches.append((tube, 1))
-            else:
-                # Generic tubes (UNK/None) - lowest priority
-                exact_matches.append((tube, 2))
+        # Both tube origin and destination must be defined and match exactly
+        if (tube_origin is not None and tube_dest is not None and
+            tube_origin == origin and tube_dest == destination):
+            exact_matches.append(tube)
     
+    # Return exact matches if found, otherwise empty list
     if exact_matches:
-        # Sort by priority (exact first, then partial, then generic)
-        exact_matches.sort(key=lambda x: x[1])
-        
-        # Get the best priority level
-        best_priority = exact_matches[0][1]
-        
-        # Use ONLY the best priority level
-        # Priority 0 = exact match (LCLK -> LLBG)
-        # Priority 1 = partial match (LCLK -> UNK or UNK -> LLBG)  
-        # Priority 2 = generic match (UNK -> UNK)
-        matched_tubes = [t[0] for t in exact_matches if t[1] == best_priority]
-        
-        return matched_tubes, True
+        return exact_matches, True
     
-    # No matches at all - fallback to all tubes
-    return all_tubes, False
+    # No exact matches - return empty list (do not calculate off course)
+    return [], False
 
 
 def _is_on_known_turn_zone(lat: float, lon: float) -> bool:
@@ -348,11 +428,45 @@ _LEARNED_OD_PATHS_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
 def _load_learned_od_paths(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load O/D-based learned paths from the new format."""
+    """Load O/D-based learned paths from PostgreSQL (or JSON file as fallback)."""
     global _LEARNED_OD_PATHS_CACHE
     if _LEARNED_OD_PATHS_CACHE is not None and not refresh:
         return _LEARNED_OD_PATHS_CACHE
     
+    # Try loading from PostgreSQL first
+    if _PG_AVAILABLE:
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, origin, destination, centerline, width_nm, member_count,
+                               min_alt_ft, max_alt_ft
+                        FROM learned_paths
+                        ORDER BY member_count DESC
+                    """)
+                    rows = cursor.fetchall()
+                    
+                    _LEARNED_OD_PATHS_CACHE = []
+                    for row in rows:
+                        centerline = json.loads(row[3]) if isinstance(row[3], str) else row[3]
+                        _LEARNED_OD_PATHS_CACHE.append({
+                            "id": row[0],
+                            "type": "od_learned",
+                            "origin": row[1],
+                            "destination": row[2],
+                            "centerline": centerline,
+                            "width_nm": row[4],
+                            "num_flights": row[5],
+                            "min_alt_ft": row[6],
+                            "max_alt_ft": row[7]
+                        })
+                    
+                    logger.info(f"Loaded {len(_LEARNED_OD_PATHS_CACHE)} paths from PostgreSQL")
+                    return _LEARNED_OD_PATHS_CACHE
+        except Exception as e:
+            logger.warning(f"Failed to load paths from PostgreSQL, falling back to JSON: {e}")
+    
+    # Fallback to JSON file
     try:
         if LEARNED_PATHS_FILE.exists():
             with open(LEARNED_PATHS_FILE, "r", encoding="utf-8") as f:
@@ -973,7 +1087,7 @@ def evaluate_rule(context: RuleContext, rule_id: int) -> RuleResult:
         # 8: _rule_diversion,
         9: _rule_low_altitude,
         # 10: _rule_signal_loss,
-        12: _rule_unplanned_israel_landing,
+        # 12: _rule_unplanned_israel_landing,
         11: _rule_off_course,
         13: _rule_military_aircraft,
     }
@@ -1307,13 +1421,16 @@ def _rule_abrupt_turn(ctx: RuleContext) -> RuleResult:
             if dt <= 0:
                 continue
             
-            # --- NEW: Ignore points descending within 5 miles of an airport ---
-            # Even if above TURN_MIN_ALT, we ignore descent segments near airports
-            # as they often involve maneuvering that isn't a "holding pattern" anomaly.
+            # --- NEW: Ignore points descending within 5 miles of an airport at low altitude ---
+            # Only suppress maneuvers that are clearly approach/landing related (below 2000ft AGL).
+            # 360-degree orbits at cruise altitude near airports are still anomalous.
             nearest_ap, dist_ap = _nearest_airport(p1)
-            if dist_ap is not None and dist_ap < 5.0:
-                # Check if descending
-                if (p1.alt or 0) < (p0.alt or 0):
+            if dist_ap is not None and dist_ap < 5.0 and nearest_ap:
+                # Calculate AGL (Above Ground Level)
+                airport_elev = nearest_ap.elevation_ft or 0
+                agl = (p1.alt or 0) - airport_elev
+                # Only suppress if descending AND below 2000ft AGL (clearly in approach phase)
+                if (p1.alt or 0) < (p0.alt or 0) and agl < 2000:
                     continue
 
             # --- High Density Logic ---
@@ -1413,29 +1530,26 @@ def _rule_abrupt_turn(ctx: RuleContext) -> RuleResult:
                     continue  # Not an orbit - aircraft traveled away from start
                 
                 # If path/displacement ratio is low, it's not really an orbit
-                if displacement_nm > 0 and path_nm / displacement_nm < 2.0:
+                # Relaxed threshold: 1.5 (down from 2.0) since 320+ degree cumulative turns
+                # are rare enough that this won't cause many false positives
+                if displacement_nm > 0 and path_nm / displacement_nm < 1.5:
                     continue  # Not looping back - just a curved path
                 
-                # Suppress if very close to an airport (likely a hold for landing)
+                # For 360-degree orbits (full circles), be LESS aggressive with suppression
+                # A complete 360 orbit with 320+ cumulative turn is inherently suspicious,
+                # even if near an airport. Only suppress if VERY close (< 2nm) to airport
+                # AND clearly in approach phase (< 1000ft AGL).
                 nearest_ap, dist_ap = _nearest_airport(p1)
-                near_airport = dist_ap is not None and dist_ap < 6.0
                 
-                # NEW: Suppress go-around patterns - check if ANY point in the pattern
-                # was close to an airport at low altitude (approach-related maneuver)
-                is_go_around_pattern = False
-                pattern_points = points[start_idx:end_idx + 1]
-                for pp in pattern_points:
-                    pp_ap, pp_dist = _nearest_airport(pp)
-                    if pp_ap and pp_dist is not None:
-                        pp_elev = pp_ap.elevation_ft or 0
-                        pp_agl = (pp.alt or 0) - pp_elev
-                        # If any point was within 5nm of airport at low altitude (< 2000ft AGL)
-                        # this looks like an approach/go-around, not a suspicious holding pattern
-                        if pp_dist < 5.0 and pp_agl < 2000:
-                            is_go_around_pattern = True
-                            break
-
-                if not near_airport and not is_go_around_pattern:
+                # Check if this is clearly a hold/approach pattern (very close + very low)
+                is_approach_hold = False
+                if nearest_ap and dist_ap and dist_ap < 2.0:
+                    airport_elev = nearest_ap.elevation_ft or 0
+                    agl = (p1.alt or 0) - airport_elev
+                    if agl < 1000:  # Very low - clearly in approach
+                        is_approach_hold = True
+                
+                if not is_approach_hold:
                     events.append({
                         "type": "holding_pattern",
                         "timestamp": p1.timestamp,
@@ -1841,6 +1955,9 @@ RUNWAY_HEADINGS = {
 
 def _heading_diff(h1, h2):
     """Smallest circular difference between two headings."""
+    # Handle None values - if either heading is missing, return max difference
+    if h1 is None or h2 is None:
+        return 360
     diff = abs(h1 - h2) % 360
     return diff if diff <= 180 else 360 - diff
 
@@ -2387,12 +2504,11 @@ def _distance_point_to_segment(
 def _rule_off_course(ctx: RuleContext) -> RuleResult:
     """
     Path adherence using tubes (3D polygon corridors) matched by O/D pair.
-    - First tries to match flight to O/D-specific tubes for polygon-based checking
-    - Falls back to path-based distance checking if no tubes match
-    - Falls back to all paths if no O/D match found
-    - On path if inside tube polygon (with altitude check).
-    - Wrong region if entering a low-activity heatmap cell.
-    - Emerging detector buckets far-off trajectories.
+    - REQUIRES both origin AND destination in metadata
+    - ONLY calculates off course if tubes exist with matching O/D
+    - On path if inside tube polygon (with altitude check)
+    - Wrong region if entering a low-activity heatmap cell
+    - Emerging detector buckets far-off trajectories
     """
 
     points = ctx.track.sorted_points()
@@ -2407,24 +2523,31 @@ def _rule_off_course(ctx: RuleContext) -> RuleResult:
         origin = ctx.metadata.origin
         destination = ctx.metadata.planned_destination
     
-    # If no O/D in metadata, skip deviation check
-    if not origin and not destination:
-        return RuleResult(11, False, "No origin/destination in metadata - cannot check deviation", {})
+    # Normalize None/"UNK"/empty strings
+    def normalize(val):
+        if not val or val == "UNK":
+            return None
+        return val
     
+    origin = normalize(origin)
+    destination = normalize(destination)
+    
+    # REQUIRE BOTH origin AND destination - skip if either is missing
+    if not origin or not destination:
+        return RuleResult(11, False, f"Missing origin or destination (origin={origin}, destination={destination}) - cannot check deviation", {})
+    if origin == destination:
+        return RuleResult(11, False, f"Origin and destination are the same (origin={origin}, destination={destination}) - cannot check deviation", {})
     # Try to use tubes first (more accurate than centerline-based paths)
     all_tubes = _load_learned_tubes()
     tubes, used_tube_od_filter = _get_tubes_for_od(origin, destination, all_tubes) if all_tubes else ([], False)
     
-    # Fallback to paths if no tubes available
-    all_paths = _get_paths()
-    if not all_paths and not tubes:
-        return RuleResult(11, False, "No path library or tubes loaded", {})
-    
-    paths, used_path_od_filter = _get_paths_for_od(origin, destination, all_paths) if all_paths else ([], False)
+    # If no tubes match the exact O/D pair, skip off course check
+    if not tubes:
+        return RuleResult(11, False, f"No tubes found for route {origin} -> {destination} - cannot check deviation", {})
     
     # Track which method we're using
     using_tubes = len(tubes) > 0
-    used_od_filter = used_tube_od_filter if using_tubes else used_path_od_filter
+    used_od_filter = used_tube_od_filter
 
     on_path: List[Dict[str, Any]] = []
     off_path: List[Dict[str, Any]] = []
@@ -2461,53 +2584,17 @@ def _rule_off_course(ctx: RuleContext) -> RuleResult:
                 )
                 continue
         
-        # Fallback to path-based checking (original method)
-        best: Optional[Tuple[str, float, float, float, str]] = None  # id, dist, pos, width, type
-        for path in paths:
-            dist_nm, pos = _distance_to_path(p, path)
-            width = float(path.get("width_nm", DEFAULT_PATH_WIDTH_NM))
-            if best is None or dist_nm < best[1]:
-                best = (path.get("id", "unknown"), dist_nm, pos, width, path.get("type", "primary"))
-
-        if best is None:
-            # Point not in tubes and no paths to check
-            off_record = {
-                "timestamp": p.timestamp,
-                "distance_nm": 999.0,
-                "lat": p.lat,
-                "lon": p.lon,
-            }
-            off_path.append(off_record)
-            far_points.append(p)
-            if not _is_in_flightable_region(p):
-                wrong_region.append(off_record)
-            continue
-
-        path_id, dist_nm, pos, width_nm, path_type = best
-        if dist_nm <= width_nm:
-            assignments[path_id] += 1
-            on_path.append(
-                {
-                    "timestamp": p.timestamp,
-                    "path_id": path_id,
-                    "method": "path",
-                    "distance_nm": round(dist_nm, 2),
-                    "position": round(pos, 3),
-                    "type": path_type,
-                }
-            )
-        else:
-            off_record = {
-                "timestamp": p.timestamp,
-                "distance_nm": round(dist_nm, 2),
-                "lat": p.lat,
-                "lon": p.lon,
-            }
-            off_path.append(off_record)
-            if dist_nm >= EMERGING_DISTANCE_NM:
-                far_points.append(p)
-            if not _is_in_flightable_region(p):
-                wrong_region.append(off_record)
+        # Point not in any tube - mark as off path
+        off_record = {
+            "timestamp": p.timestamp,
+            "distance_nm": 999.0,  # Not in any tube
+            "lat": p.lat,
+            "lon": p.lon,
+        }
+        off_path.append(off_record)
+        far_points.append(p)
+        if not _is_in_flightable_region(p):
+            wrong_region.append(off_record)
 
     promoted = None
     if far_points:
@@ -2530,12 +2617,10 @@ def _rule_off_course(ctx: RuleContext) -> RuleResult:
         "detected_destination": destination,
         "used_od_filter": used_od_filter,
         "using_tubes": using_tubes,
-        "tubes_checked": len(tubes) if using_tubes else 0,
-        "paths_checked": len(paths),
+        "tubes_checked": len(tubes),
     }
 
     return RuleResult(11, matched, summary, details)
-
 
 def _points_near_airport(points: Sequence[TrackPoint], airport: Airport, radius_nm: float) -> List[TrackPoint]:
     return [p for p in points if haversine_nm(p.lat, p.lon, airport.lat, airport.lon) <= radius_nm]

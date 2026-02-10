@@ -20,6 +20,7 @@ import time
 import json
 import logging
 import io
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,7 +32,7 @@ FILTER_EXCLUDED_PREFIXES = ("4XC", "4XB", "CHLE", "4XA", "HMR")
 from fr24sdk.client import Client
 from fr24sdk.models.geographic import Boundary
 from anomaly_pipeline import AnomalyPipeline
-from core.models import FlightTrack, TrackPoint
+from core.models import FlightTrack, TrackPoint, FlightMetadata
 from core.config import TRAIN_NORTH, TRAIN_SOUTH, TRAIN_EAST, TRAIN_WEST
 from core.geodesy import haversine_nm
 from core.military_detection import is_military
@@ -76,7 +77,10 @@ MIN_LON = TRAIN_WEST
 MAX_LON = TRAIN_EAST
 
 API_TOKEN = "019aca50-8288-7260-94b5-6d82fbeb351c|dC21vuw2bsf2Y43qAlrBKb7iSM9ibqSDT50x3giN763b577b"
-POLL_INTERVAL = 4  # seconds
+
+# Optimized polling strategy to reduce FR24 API costs
+DISCOVERY_SCAN_INTERVAL = 45  # Full bbox scan to find NEW flights (seconds)
+UPDATE_SCAN_INTERVAL = 8  # Quick position updates for tracked flights (seconds)
 MIN_POINTS_FOR_ANALYSIS = 20  # Need some history for ML models
 STALE_FLIGHT_TIMEOUT = 600  # 10 minutes - remove flights not seen
 
@@ -566,6 +570,7 @@ class FlightState:
         self.last_analyzed_count = 0
         self.was_anomaly = False  # Track if previously flagged as anomaly
         self.fr24_summary: Optional[Dict] = None  # FR24 summary data for metadata
+        self.full_track_loaded = False  # Track if we've loaded the full historical track
 
     def add_point(self, point: TrackPoint):
         """Add a new point if timestamp is newer than the last one."""
@@ -593,6 +598,24 @@ class RealtimeMonitor:
         
         # Initialize anomaly pipeline with PostgreSQL enabled
         self.pipeline = AnomalyPipeline(use_postgres=True)
+        
+        # Initialize AI Classifier (optional - requires GEMINI_API_KEY)
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyBArSFAlxqm-9q1hWbaNgeT7f3WMOqF5Go")
+        if gemini_api_key:
+            try:
+                from ai_classify import AIClassifier
+                self.ai_classifier = AIClassifier(gemini_api_key, schema=self.schema)
+                logger.info("✨ AI Classifier initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize AI Classifier: {e}")
+                self.ai_classifier = None
+        else:
+            self.ai_classifier = None
+            logger.info("AI Classification disabled (GEMINI_API_KEY not set)")
+        
+        # Track last discovery scan time for optimized polling
+        self.last_discovery_scan = 0.0
+        self.scan_cycle_count = 0  # For logging stats
 
     def setup_db(self):
         """Initialize PostgreSQL connection and verify schema."""
@@ -672,142 +695,207 @@ class RealtimeMonitor:
             logger.error(f"Failed to check monitor status: {e}")
             return False
 
-    def fetch_and_process(self):
-        """Fetch live flights and process them."""
-        try:
-            logger.info("Fetching live positions...")
-            response = self.client.live.flight_positions.get_full(
-                bounds=self.boundary,
-                altitude_ranges=["1000-50000"]
-            )
-            time.sleep(1)
-            live_data = response.model_dump()["data"]
-            current_ids = set()
+    def discovery_scan(self):
+        """
+        Full bbox scan to discover NEW flights.
+        This is the expensive operation - only do periodically.
+        """
+        logger.info("🔍 DISCOVERY SCAN: Fetching all flights in bounding box...")
+        response = self.client.live.flight_positions.get_full(
+            bounds=self.boundary,
+            altitude_ranges=["1000-50000"]
+        )
+        time.sleep(1)
+        live_data = response.model_dump()["data"]
+        
+        new_flights = 0
+        updated_flights = 0
+        
+        logger.info(f"Found {len(live_data)} flights in bounding box")
+        
+        for item in live_data:
+            flight_id = item["fr24_id"]
             
-            logger.info(f"Found {len(live_data)} flights in bounding box")
+            # Check callsign prefixes
+            if item.get("callsign"):
+                callsign = item["callsign"].strip().upper()
+                if callsign.startswith(FILTER_EXCLUDED_PREFIXES):
+                    continue
             
-            for item in live_data:
-                flight_id = item["fr24_id"]
+            # Check if this is a NEW flight
+            is_new_flight = flight_id not in self.active_flights
+            
+            if is_new_flight:
+                new_flights += 1
+                self.active_flights[flight_id] = FlightState(flight_id)
+                logger.info(f"✨ NEW FLIGHT: {flight_id} ({item.get('callsign', 'N/A')})")
                 
-                # Check callsign prefixes
-                if item.get("callsign"):
-                    callsign = item["callsign"].strip().upper()
-                    if callsign.startswith(FILTER_EXCLUDED_PREFIXES):
-                        continue
+                # Fetch full historical track for new flight ONLY
+                self._load_full_track(flight_id)
                 
-                current_ids.add(flight_id)
-                
-                # Init state if new
-                if flight_id not in self.active_flights:
-                    self.active_flights[flight_id] = FlightState(flight_id)
-                    logger.info(f"New flight tracked: {flight_id} ({item.get('callsign', 'N/A')})")
-                    
-                    # Fetch historical track to warm up the state
-                    try:
-                        hist_resp = self.client.flight_tracks.get(flight_id=flight_id)
-                        time.sleep(1)
-                        if hist_resp:
-                            flight_data = hist_resp.model_dump()["data"][0]
-                            track_points = flight_data.get("tracks", [])
-                            
-                            for tp in track_points:
-                                ts_str = tp["timestamp"]
-                                if isinstance(ts_str, str):
-                                    ts_hist = int(datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp())
-                                else:
-                                    ts_hist = ts_str
-                                
-                                p_hist = TrackPoint(
-                                    flight_id=flight_id,
-                                    timestamp=ts_hist,
-                                    lat=tp["lat"],
-                                    lon=tp["lon"],
-                                    alt=tp["alt"],
-                                    gspeed=tp.get("gspeed"),
-                                    vspeed=tp.get("vspeed"),
-                                    track=tp.get("track"),
-                                    squawk=str(tp.get("squawk")) if tp.get("squawk") else None,
-                                    callsign=tp.get("callsign"),
-                                    source=tp.get("source"),
-                                )
-                                self.active_flights[flight_id].add_point(p_hist)
-                            
-                            logger.info("Loaded %d historical points for %s", len(track_points), flight_id)
-                    except Exception as e:
-                        logger.warning(f"Could not fetch history for {flight_id}: {e}")
-                    
-                    # Fetch flight summary for complete metadata (origin/dest airports, aircraft type, etc.)
-                    try:
-                        summary_resp = self.client.flight_summary.get_full(flight_ids=[flight_id])
-                        time.sleep(1)
-                        if summary_resp:
-                            summary_data = summary_resp.model_dump()["data"]
-                            if summary_data:
-                                self.active_flights[flight_id].fr24_summary = summary_data[0]
-                                fr24_sum = self.active_flights[flight_id].fr24_summary
-                                
-                                # Log ALL available keys from FR24 response for debugging
-                                logger.debug(f"FR24 get_full response keys for {flight_id}: {list(fr24_sum.keys())}")
-                                
-                                # Extract all metadata fields from FR24 get_full response
-                                # Try multiple possible field names for each field
-                                callsign = fr24_sum.get("callsign") or fr24_sum.get("call_sign") or fr24_sum.get("cs")
-                                flight_number = fr24_sum.get("flight") or fr24_sum.get("flight_number")
-                                aircraft_reg = fr24_sum.get("reg") or fr24_sum.get("registration")
-                                aircraft_type = fr24_sum.get("type") or fr24_sum.get("aircraft_code") or fr24_sum.get("equip")
-                                category = fr24_sum.get("category")
-                                
-                                # Airline info
-                                airline_code = (fr24_sum.get("operating_as") or fr24_sum.get("painted_as") or 
-                                               fr24_sum.get("airline_icao") or fr24_sum.get("operator"))
-                                
-                                # Origin airport - try all possible field names
-                                origin = (fr24_sum.get("orig_icao") or fr24_sum.get("orig_iata") or
-                                         fr24_sum.get("origin_icao") or fr24_sum.get("origin_iata") or
-                                         fr24_sum.get("schd_from") or fr24_sum.get("origin") or
-                                         fr24_sum.get("departure_airport") or fr24_sum.get("dep_icao"))
-                                origin_name = fr24_sum.get("orig_name") or fr24_sum.get("origin_name")
-                                
-                                # Destination airport - try all possible field names
-                                dest = (fr24_sum.get("dest_icao") or fr24_sum.get("dest_iata") or
-                                       fr24_sum.get("destination_icao") or fr24_sum.get("destination_iata") or
-                                       fr24_sum.get("schd_to") or fr24_sum.get("destination") or
-                                       fr24_sum.get("arrival_airport") or fr24_sum.get("arr_icao"))
-                                dest_name = fr24_sum.get("dest_name") or fr24_sum.get("destination_name")
-                                
-                                logger.info(f"Loaded FR24 summary for {flight_id}: callsign={callsign}, flight={flight_number}, "
-                                           f"reg={aircraft_reg}, type={aircraft_type}, airline={airline_code}, "
-                                           f"origin={origin} ({origin_name}), dest={dest} ({dest_name}), category={category}")
-                    except Exception as e:
-                        logger.debug(f"Could not fetch summary for {flight_id}: {e}")
-                
+                # Fetch flight summary for metadata
+                self._load_flight_summary(flight_id)
+            else:
+                updated_flights += 1
+            
+            # Add current position to state
+            state = self.active_flights[flight_id]
+            self._add_position_point(state, item)
+        
+        self.last_discovery_scan = time.time()
+        logger.info(f"✅ Discovery scan complete: {new_flights} new, {updated_flights} updated")
+        return new_flights, updated_flights
+    
+    def update_scan(self):
+        """
+        Quick position updates for flights we're already tracking.
+        This reuses the bbox scan but skips expensive full track fetches.
+        """
+        logger.info("⚡ UPDATE SCAN: Refreshing positions for tracked flights...")
+        response = self.client.live.flight_positions.get_full(
+            bounds=self.boundary,
+            altitude_ranges=["1000-50000"]
+        )
+        time.sleep(1)
+        live_data = response.model_dump()["data"]
+        current_ids = set()
+        updated_count = 0
+        
+        for item in live_data:
+            flight_id = item["fr24_id"]
+            current_ids.add(flight_id)
+            
+            # Check callsign prefixes
+            if item.get("callsign"):
+                callsign = item["callsign"].strip().upper()
+                if callsign.startswith(FILTER_EXCLUDED_PREFIXES):
+                    continue
+            
+            # Only update tracked flights - ignore new ones until next discovery scan
+            if flight_id in self.active_flights:
                 state = self.active_flights[flight_id]
+                self._add_position_point(state, item)
+                updated_count += 1
+        
+        # Mark flights no longer in bbox (but don't delete yet - they might return)
+        missing = set(self.active_flights.keys()) - current_ids
+        if missing:
+            logger.debug(f"{len(missing)} flights temporarily out of view")
+        
+        logger.info(f"✅ Update scan complete: {updated_count} positions updated")
+        return updated_count
+    
+    def _load_full_track(self, flight_id: str):
+        """Load complete historical track for a flight (expensive operation)."""
+        try:
+            hist_resp = self.client.flight_tracks.get(flight_id=flight_id)
+            time.sleep(1)
+            if hist_resp:
+                flight_data = hist_resp.model_dump()["data"][0]
+                track_points = flight_data.get("tracks", [])
                 
-                # Parse timestamp
-                ts = item.get("timestamp")
-                if isinstance(ts, str):
-                    ts = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+                for tp in track_points:
+                    ts_str = tp["timestamp"]
+                    if isinstance(ts_str, str):
+                        ts_hist = int(datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp())
+                    else:
+                        ts_hist = ts_str
+                    
+                    p_hist = TrackPoint(
+                        flight_id=flight_id,
+                        timestamp=ts_hist,
+                        lat=tp["lat"],
+                        lon=tp["lon"],
+                        alt=tp["alt"],
+                        gspeed=tp.get("gspeed"),
+                        vspeed=tp.get("vspeed"),
+                        track=tp.get("track"),
+                        squawk=str(tp.get("squawk")) if tp.get("squawk") else None,
+                        callsign=tp.get("callsign"),
+                        source=tp.get("source"),
+                    )
+                    self.active_flights[flight_id].add_point(p_hist)
                 
-                # Get callsign from FR24 summary if available, otherwise from item
-                fr24_summary = state.fr24_summary
-                callsign = (fr24_summary.get("callsign") if fr24_summary else None) or item.get("callsign")
-                
-                # Create new point
-                point = TrackPoint(
-                    flight_id=flight_id,
-                    timestamp=ts or int(time.time()),
-                    lat=item["lat"],
-                    lon=item["lon"],
-                    alt=item.get("alt", 0),
-                    gspeed=item.get("gspeed"),
-                    vspeed=item.get("vspeed"),
-                    track=item.get("track"),
-                    squawk=item.get("squawk"),
-                    callsign=callsign,
-                    source=item.get("source")
-                )
-                state.add_point(point)
-                
+                self.active_flights[flight_id].full_track_loaded = True
+                logger.info(f"📥 Loaded {len(track_points)} historical points for {flight_id}")
+        except Exception as e:
+            logger.warning(f"Could not fetch history for {flight_id}: {e}")
+    
+    def _load_flight_summary(self, flight_id: str):
+        """Load flight summary metadata (origin, dest, aircraft type, etc)."""
+        try:
+            summary_resp = self.client.flight_summary.get_full(flight_ids=[flight_id])
+            time.sleep(1)
+            if summary_resp:
+                summary_data = summary_resp.model_dump()["data"]
+                if summary_data:
+                    self.active_flights[flight_id].fr24_summary = summary_data[0]
+                    fr24_sum = self.active_flights[flight_id].fr24_summary
+                    
+                    # Extract key metadata for logging
+                    callsign = fr24_sum.get("callsign") or fr24_sum.get("call_sign") or fr24_sum.get("cs")
+                    flight_number = fr24_sum.get("flight") or fr24_sum.get("flight_number")
+                    aircraft_reg = fr24_sum.get("reg") or fr24_sum.get("registration")
+                    aircraft_type = fr24_sum.get("type") or fr24_sum.get("aircraft_code")
+                    origin = fr24_sum.get("orig_icao") or fr24_sum.get("origin_icao") or fr24_sum.get("schd_from")
+                    dest = fr24_sum.get("dest_icao") or fr24_sum.get("destination_icao") or fr24_sum.get("schd_to")
+                    
+                    logger.info(f"📋 Loaded summary for {flight_id}: {callsign} | {flight_number} | "
+                               f"{aircraft_type} ({aircraft_reg}) | {origin}→{dest}")
+        except Exception as e:
+            logger.debug(f"Could not fetch summary for {flight_id}: {e}")
+    
+    def _add_position_point(self, state: FlightState, item: Dict):
+        """Add a position point to flight state."""
+        # Parse timestamp
+        ts = item.get("timestamp")
+        if isinstance(ts, str):
+            ts = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+        
+        # Get callsign from FR24 summary if available, otherwise from item
+        fr24_summary = state.fr24_summary
+        callsign = (fr24_summary.get("callsign") if fr24_summary else None) or item.get("callsign")
+        
+        # Create new point
+        point = TrackPoint(
+            flight_id=state.flight_id,
+            timestamp=ts or int(time.time()),
+            lat=item["lat"],
+            lon=item["lon"],
+            alt=item.get("alt", 0),
+            gspeed=item.get("gspeed"),
+            vspeed=item.get("vspeed"),
+            track=item.get("track"),
+            squawk=item.get("squawk"),
+            callsign=callsign,
+            source=item.get("source")
+        )
+        state.add_point(point)
+    
+    def fetch_and_process(self):
+        """
+        Optimized fetch strategy:
+        - Full discovery scan every 45s (finds new flights, loads their full tracks)
+        - Quick update scan every 8s (just position updates for tracked flights)
+        This reduces API costs dramatically while keeping data fresh.
+        """
+        try:
+            self.scan_cycle_count += 1
+            current_time = time.time()
+            time_since_discovery = current_time - self.last_discovery_scan
+            
+            # Decide which type of scan to do
+            if time_since_discovery >= DISCOVERY_SCAN_INTERVAL:
+                # Time for expensive discovery scan
+                new_count, update_count = self.discovery_scan()
+            else:
+                # Quick update scan for existing flights only
+                update_count = self.update_scan()
+                new_count = 0
+            
+            # Process all tracked flights for anomaly detection
+            analyzed_count = 0
+            for flight_id, state in list(self.active_flights.items()):
                 # Check if ready for analysis (every 5 new points)
                 if len(state.points) >= MIN_POINTS_FOR_ANALYSIS:
                     if len(state.points) - state.last_analyzed_count >= 5:
@@ -819,55 +907,147 @@ class RealtimeMonitor:
                         
                         # Run Pipeline
                         track = state.to_flight_track()
-                        report = self.pipeline.analyze(track)
+                        
+                        # Calculate comprehensive metadata dict with FR24 summary
+                        metadata_dict = FlightMetadataCalculator.calculate(track, fr24_summary=state.fr24_summary)
+                        
+                        # Convert dict to FlightMetadata object for rule engine
+                        # The rule engine only needs origin, destination, and route
+                        metadata_obj = FlightMetadata(
+                            origin=metadata_dict.get('origin_airport'),
+                            planned_destination=metadata_dict.get('destination_airport'),
+                            planned_route=None  # Could extract from dict if available
+                        )
+                        
+                        # Run analysis with FlightMetadata object
+                        report = self.pipeline.analyze(track, metadata=metadata_obj)
                         is_anomaly = report["summary"]["is_anomaly"]
                         
-                        # Calculate metadata with FR24 summary if available
-                        metadata = FlightMetadataCalculator.calculate(track, fr24_summary=state.fr24_summary)
-                        metadata['is_anomaly'] = is_anomaly
+                        # Add anomaly flag to metadata dict for saving
+                        metadata_dict['is_anomaly'] = is_anomaly
                         
-                        # Save metadata
-                        self.save_metadata(metadata)
+                        # Save comprehensive metadata dict
+                        self.save_metadata(metadata_dict)
                         
                         # Save tracks
                         self.save_tracks(track, is_anomaly)
                         
                         # Save/update report
                         last_ts = track.points[-1].timestamp if track.points else int(time.time())
-                        self.save_report(report, last_ts, metadata)
+                        self.save_report(report, last_ts, metadata_dict)
+                        
+                        # Trigger AI classification for anomalies (async, non-blocking)
+                        if is_anomaly and self.ai_classifier:
+                            # Convert track points to dictionaries for AI classifier
+                            flight_data_dicts = [
+                                {
+                                    "timestamp": p.timestamp,
+                                    "lat": p.lat,
+                                    "lon": p.lon,
+                                    "alt": p.alt,
+                                    "gspeed": p.gspeed,
+                                    "vspeed": p.vspeed,
+                                    "track": p.track,
+                                    "squawk": p.squawk,
+                                    "callsign": p.callsign
+                                }
+                                for p in track.points
+                            ]
+                            
+                            # Trigger async classification
+                            self.ai_classifier.classify_async(
+                                flight_id=flight_id,
+                                flight_data=flight_data_dicts,
+                                anomaly_report=report,
+                                metadata=metadata_dict
+                            )
+                            logger.info(f"🤖 Triggered AI classification for {flight_id}")
                         
                         # Log status change
                         if is_anomaly and not state.was_anomaly:
-                            logger.warning(f"ANOMALY DETECTED: {flight_id} ({metadata.get('callsign', 'N/A')})")
+                            logger.warning(f" ANOMALY DETECTED: {flight_id} ({metadata_dict.get('callsign', 'N/A')})")
                         elif not is_anomaly and state.was_anomaly:
-                            logger.info(f"ANOMALY CLEARED: {flight_id} now normal")
+                            logger.info(f"✅ ANOMALY CLEARED: {flight_id} now normal")
                         
                         state.was_anomaly = is_anomaly
                         state.last_analyzed_count = len(state.points)
+                        analyzed_count += 1
             
             # Cleanup stale flights
             removed = self.cleanup_stale_flights()
-            if removed:
-                logger.info(f"Cleaned up {removed} stale flights")
             
-            logger.info(f"Active flights: {len(self.active_flights)}")
+            # Log cycle summary
+            logger.info(f"📊 Cycle #{self.scan_cycle_count} complete: "
+                       f"{len(self.active_flights)} active flights | "
+                       f"{analyzed_count} analyzed | "
+                       f"{removed} removed | "
+                       f"Next discovery in {int(DISCOVERY_SCAN_INTERVAL - time_since_discovery)}s")
             
         except Exception as e:
             logger.error(f"Fetch loop error: {e}", exc_info=True)
 
     def run(self):
-        """Main monitoring loop."""
-        logger.info("Starting Realtime Monitor")
-        logger.info(f"Bounding Box: Lat {MIN_LAT}-{MAX_LAT}, Lon {MIN_LON}-{MAX_LON}")
-        logger.info(f"Poll Interval: {POLL_INTERVAL}s, Stale Timeout: {STALE_FLIGHT_TIMEOUT}s")
+        """Main monitoring loop with optimized two-phase scanning."""
+        logger.info("=" * 80)
+        logger.info("🚀 Starting Optimized Realtime Monitor")
+        logger.info("=" * 80)
+        logger.info(f"📍 Bounding Box: Lat {MIN_LAT}-{MAX_LAT}, Lon {MIN_LON}-{MAX_LON}")
+        logger.info(f"⏱️  Discovery Scan: Every {DISCOVERY_SCAN_INTERVAL}s (finds new flights + full tracks)")
+        logger.info(f"⚡ Update Scan: Every {UPDATE_SCAN_INTERVAL}s (position updates only)")
+        logger.info(f"🗑️  Stale Timeout: {STALE_FLIGHT_TIMEOUT}s")
+        logger.info(f"💰 Cost Savings: ~{int(DISCOVERY_SCAN_INTERVAL/UPDATE_SCAN_INTERVAL)}x fewer expensive API calls")
+        logger.info("=" * 80)
+        
+        # Track heartbeat and errors for health monitoring
+        last_heartbeat = time.time()
+        consecutive_errors = 0
+        max_consecutive_errors = 5
         
         while True:
-            if self.is_monitoring_active():
-                logger.info("Monitor is active, processing flights...")
-                self.fetch_and_process()
-            else:
-                logger.info("Monitor is inactive, skipping processing...")
-            time.sleep(POLL_INTERVAL)
+            try:
+                # Heartbeat log every 5 minutes
+                if time.time() - last_heartbeat >= 300:
+                    logger.info(f"💓 HEARTBEAT: Service alive. Active flights: {len(self.active_flights)}, "
+                               f"Scan cycle: {self.scan_cycle_count}, Consecutive errors: {consecutive_errors}")
+                    last_heartbeat = time.time()
+                
+                # Check if monitoring is active
+                try:
+                    is_active = self.is_monitoring_active()
+                except Exception as e:
+                    logger.error(f"Failed to check monitor status: {e}. Assuming inactive.", exc_info=True)
+                    is_active = False
+                
+                if is_active:
+                    self.fetch_and_process()
+                    consecutive_errors = 0  # Reset error counter on success
+                    time.sleep(UPDATE_SCAN_INTERVAL)
+                else:
+                    logger.info("Monitor is inactive, sleeping...")
+                    time.sleep(UPDATE_SCAN_INTERVAL)
+                    
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, shutting down...")
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"CRITICAL ERROR in main loop (error {consecutive_errors}/{max_consecutive_errors}): {e}", 
+                           exc_info=True)
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.critical(f"Too many consecutive errors ({consecutive_errors}). Exiting...")
+                    break
+                
+                # Back off exponentially on errors
+                sleep_time = min(60, UPDATE_SCAN_INTERVAL * (2 ** consecutive_errors))
+                logger.info(f"Sleeping {sleep_time}s before retry...")
+                time.sleep(sleep_time)
+        
+        # Cleanup on exit
+        logger.info("Shutting down monitor...")
+        if self.ai_classifier:
+            self.ai_classifier.shutdown(wait=True)
+        logger.info("Monitor shutdown complete")
 
 
 if __name__ == "__main__":

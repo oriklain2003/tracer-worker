@@ -15,6 +15,7 @@ from psycopg2 import pool, sql
 import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
 
@@ -57,15 +58,62 @@ def init_connection_pool(dsn: str = None, minconn: int = 2, maxconn: int = 10):
 
 @contextmanager
 def get_connection():
-    """Get a connection from the pool (context manager)."""
+    """Get a connection from the pool (context manager) with health checks."""
+    global _connection_pool
+    
     if _connection_pool is None:
         init_connection_pool()
     
-    conn = _connection_pool.getconn()
-    try:
-        yield conn
-    finally:
-        _connection_pool.putconn(conn)
+    conn = None
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            conn = _connection_pool.getconn()
+            
+            # Test if connection is alive
+            try:
+                with conn.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
+                    test_cursor.fetchone()
+            except Exception as test_error:
+                logger.warning(f"Connection health check failed: {test_error}. Attempting to reconnect...")
+                # Connection is dead, close it and get a new one
+                try:
+                    conn.close()
+                except:
+                    pass
+                
+                # Reinitialize the pool if too many failures
+                if attempt == max_retries - 1:
+                    logger.warning("Reinitializing connection pool due to repeated failures...")
+                    try:
+                        _connection_pool.closeall()
+                    except:
+                        pass
+                    _connection_pool = None
+                    init_connection_pool()
+                    conn = _connection_pool.getconn()
+                else:
+                    conn = _connection_pool.getconn()
+                    continue
+            
+            # Connection is good, yield it
+            yield conn
+            conn.commit()
+            return
+            
+        except Exception as e:
+            logger.error(f"Database connection error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(1 * (attempt + 1))  # Exponential backoff
+        finally:
+            if conn:
+                try:
+                    _connection_pool.putconn(conn)
+                except Exception as e:
+                    logger.error(f"Error returning connection to pool: {e}")
 
 
 def execute_query(query: str, params: tuple = None, fetch: bool = False, schema: str = 'live'):
@@ -347,4 +395,104 @@ def test_connection() -> bool:
                 return True
     except Exception as e:
         logger.error(f"PostgreSQL connection test failed: {e}")
+        return False
+
+
+def create_ai_classifications_table(schema: str = 'live') -> bool:
+    """
+    Create ai_classifications table for storing AI-generated anomaly classifications.
+    
+    Args:
+        schema: Schema name (default: 'live')
+    
+    Returns:
+        bool: Success status
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                create_table_query = sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {}.ai_classifications (
+                        id SERIAL PRIMARY KEY,
+                        flight_id TEXT NOT NULL,
+                        classification_text TEXT NOT NULL,
+                        confidence_score FLOAT,
+                        full_response TEXT,
+                        processing_time_sec FLOAT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        error_message TEXT,
+                        gemini_model TEXT
+                    )
+                """).format(sql.Identifier(schema))
+                
+                cursor.execute(create_table_query)
+                
+                # Create indexes
+                cursor.execute(sql.SQL("""
+                    CREATE INDEX IF NOT EXISTS idx_ai_classifications_flight_id 
+                        ON {}.ai_classifications(flight_id)
+                """).format(sql.Identifier(schema)))
+                
+                cursor.execute(sql.SQL("""
+                    CREATE INDEX IF NOT EXISTS idx_ai_classifications_created_at 
+                        ON {}.ai_classifications(created_at DESC)
+                """).format(sql.Identifier(schema)))
+                
+                conn.commit()
+                logger.info(f"AI classifications table created successfully in schema '{schema}'")
+                return True
+                
+    except Exception as e:
+        logger.error(f"Failed to create ai_classifications table: {e}")
+        return False
+
+
+def save_ai_classification(
+    flight_id: str, 
+    classification: Dict[str, Any], 
+    schema: str = 'live'
+) -> bool:
+    """
+    Save AI classification result to PostgreSQL.
+    
+    Args:
+        flight_id: Flight identifier
+        classification: Dictionary containing:
+            - classification_text: 3-6 word summary
+            - confidence_score: Optional confidence value
+            - full_response: Complete AI response
+            - processing_time_sec: Time taken for classification
+            - error_message: Error message if failed
+            - gemini_model: Model name used
+        schema: Schema name (default: 'live')
+    
+    Returns:
+        bool: Success status
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                insert_query = sql.SQL("""
+                    INSERT INTO {}.ai_classifications (
+                        flight_id, classification_text, confidence_score, 
+                        full_response, processing_time_sec, error_message, gemini_model
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """).format(sql.Identifier(schema))
+                
+                cursor.execute(insert_query, (
+                    flight_id,
+                    classification.get('classification_text'),
+                    classification.get('confidence_score'),
+                    classification.get('full_response'),
+                    classification.get('processing_time_sec'),
+                    classification.get('error_message'),
+                    classification.get('gemini_model', 'gemini-3-flash-preview')
+                ))
+                
+                conn.commit()
+                logger.info(f"Saved AI classification for flight {flight_id}")
+                return True
+                
+    except Exception as e:
+        logger.error(f"Failed to save AI classification for {flight_id}: {e}")
         return False

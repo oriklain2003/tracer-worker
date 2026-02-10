@@ -1,0 +1,16 @@
+# Example Flight IDs for Batch Classification
+# One flight ID per line (lines starting with # are ignored)
+#
+# These are example IDs from your context - replace with actual flight IDs from your database
+#
+# To find unclassified flights, run:
+# psql -t -c "SELECT flight_id FROM research.anomaly_reports WHERE is_anomaly = TRUE LIMIT 10" > flight_ids.txt
+#
+# Then run:
+# python batch_classify_flights.py --file flight_ids.txt
+
+3d7211ef
+3cf959dd
+3ad2166a
+3adf2c74
+3ade9062

@@ -10,6 +10,7 @@
     { "code": "LLMG", "name": "Megiddo", "lat": 32.597, "lon": 35.228, "elevation_ft": 217 },
     { "code": "LLHZ", "name": "Herzliya", "lat": 32.186, "lon": 34.835, "elevation_ft": 121 },
     { "code": "LLSD", "name": "Sde Dov", "lat": 32.1147, "lon": 34.7822, "elevation_ft": 43 },
+    { "code": "LLAD", "name": "Ashdod", "lat": 31.7172, "lon": 34.6486, "elevation_ft": 151 },
 
     { "code": "LCRA", "name": "RAF Akrotiri (Cyprus)", "lat": 34.5900, "lon": 32.9870, "elevation_ft": 76 },
     { "code": "LCLK", "name": "Larnaca Intl (Cyprus)", "lat": 34.8751, "lon": 33.6249, "elevation_ft": 8 },
@@ -88,6 +89,8 @@
       "repeat_count": 2
     },
     "path_learning": {
+      "tube_altitude_tolerance_ft": 60000.0,
+
       "paths_file": "rules/path_library_v2.json",
       "heatmap_file": "rules/flight_heatmap_v2.npy",
       "num_samples": 120,
@@ -99,7 +102,8 @@
       "emerging_distance_nm": 12.0,
       "emerging_bucket_size": 5,
       "emerging_similarity_deg": 30,
-      "default_width_nm": 8.0
+      "default_width_nm": 8.0,
+      "tube_lateral_tolerance_nm": 20.0
     },
     "unplanned_israel_landing": {
       "near_airport_nm": 5
