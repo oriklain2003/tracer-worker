@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import csv
 import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-import logging
 
 import numpy as np
 
@@ -21,16 +21,6 @@ from core.geodesy import (
 from core.path_utils import resample_track_points, point_to_polyline_distance_nm
 from core.models import FlightTrack, RuleContext, RuleResult, TrackPoint
 from core.military_detection import is_military
-
-# Import PostgreSQL provider for loading learned behaviors
-try:
-    from pg_provider import get_connection
-    _PG_AVAILABLE = True
-except ImportError:
-    _PG_AVAILABLE = False
-    logging.warning("pg_provider not available, will use JSON files as fallback")
-
-logger = logging.getLogger(__name__)
 
 CONFIG = load_rule_config()
 RULES = CONFIG.get("rules", {})
@@ -104,6 +94,7 @@ PATH_SECONDARY_RADIUS_NM = float(PATH_CFG.get("secondary_radius_nm", 15.0))
 HEATMAP_CELL_DEG = float(PATH_CFG.get("heatmap_cell_deg", 0.05))
 HEATMAP_THRESHOLD = int(PATH_CFG.get("heatmap_threshold", 5))
 MIN_OFF_COURSE_POINTS = int(PATH_CFG.get("min_off_course_points", 15))
+OFF_COURSE_MIN_ALTITUDE_FT = float(PATH_CFG.get("min_altitude_ft", 9000))
 EMERGING_DISTANCE_NM = float(PATH_CFG.get("emerging_distance_nm", 12.0))
 EMERGING_BUCKET_SIZE = int(PATH_CFG.get("emerging_bucket_size", 5))
 EMERGING_SIMILARITY_DEG = int(PATH_CFG.get("emerging_similarity_deg", 30))
@@ -120,16 +111,6 @@ _LEARNED_SID_CACHE: Optional[List[Dict[str, Any]]] = None
 _LEARNED_STAR_CACHE: Optional[List[Dict[str, Any]]] = None
 _LEARNED_TUBES_CACHE: Optional[List[Dict[str, Any]]] = None
 
-# Initialize PostgreSQL connection pool if available
-if _PG_AVAILABLE:
-    try:
-        from pg_provider import init_connection_pool
-        init_connection_pool()
-        logger.info("PostgreSQL connection pool initialized for learned behaviors")
-    except Exception as e:
-        logger.warning(f"Failed to initialize PostgreSQL connection pool: {e}")
-        _PG_AVAILABLE = False
-
 # Learned behavior configuration (optional - may not exist)
 LEARNED_BEHAVIOR_CFG = RULES.get("learned_behavior", {})
 _lb_turns_file = Path(LEARNED_BEHAVIOR_CFG.get("turns_file", "rules/learned_turns.json"))
@@ -139,7 +120,140 @@ LEARNED_SID_FILE = (_lb_sid_file if _lb_sid_file.is_absolute() else (PROJECT_ROO
 _lb_star_file = Path(LEARNED_BEHAVIOR_CFG.get("star_file", "rules/learned_star.json"))
 LEARNED_STAR_FILE = (_lb_star_file if _lb_star_file.is_absolute() else (PROJECT_ROOT / _lb_star_file)).resolve()
 TURN_ZONE_TOLERANCE_NM = float(LEARNED_BEHAVIOR_CFG.get("turn_zone_tolerance_nm", 3.0))
+
+# Circular flight configuration
+CIRCULAR_FLIGHT_CFG = _require_rule_config("circular_flight")
+CIRCULAR_MIN_DURATION_SEC = int(CIRCULAR_FLIGHT_CFG["min_duration_seconds"])
+CIRCULAR_MAX_CLOSURE_NM = float(CIRCULAR_FLIGHT_CFG["max_circle_closure_nm"])
+CIRCULAR_MIN_OFF_ROUTE_RATIO = float(CIRCULAR_FLIGHT_CFG["min_off_route_ratio"])
+CIRCULAR_MIN_ALTITUDE_FT = float(CIRCULAR_FLIGHT_CFG.get("min_altitude_ft", 5000))
+CIRCULAR_NON_COMMERCIAL_CATEGORIES = CIRCULAR_FLIGHT_CFG["non_commercial_categories"]
+
+# Distance trend diversion configuration
+DTD_CFG = _require_rule_config("distance_trend_diversion")
+DTD_CHECK_WINDOW_SEC = int(DTD_CFG["check_window_seconds"])
+DTD_SAMPLE_INTERVAL_SEC = int(DTD_CFG["sample_interval_seconds"])
+DTD_MIN_INCREASING_RATIO = float(DTD_CFG["min_increasing_ratio"])
+DTD_MIN_CRUISE_ALT_FT = float(DTD_CFG["min_cruise_altitude_ft"])
+DTD_POST_LANDING_MIN_DIST_NM = float(DTD_CFG["post_landing_min_distance_nm"])
 SID_STAR_TOLERANCE_NM = float(LEARNED_BEHAVIOR_CFG.get("sid_star_tolerance_nm", 5.0))
+
+# Performance mismatch configuration (Rule 16)
+PERF_MISMATCH_CFG = RULES.get("performance_mismatch", {})
+PERF_AIRCRAFT_DATA_CSV = Path(PERF_MISMATCH_CFG.get("aircraft_data_csv", "docs/aircraft_data.csv"))
+PERF_APPROACH_THRESHOLD = float(PERF_MISMATCH_CFG.get("approach_threshold_deg_sec", 4.0))
+PERF_CRUISE_HEAVY_THRESHOLD = float(PERF_MISMATCH_CFG.get("cruise_heavy_threshold_deg_sec", 1.5))
+PERF_CRUISE_LARGE_THRESHOLD = float(PERF_MISMATCH_CFG.get("cruise_large_threshold_deg_sec", 2.0))
+PERF_CRUISE_SMALL_THRESHOLD = float(PERF_MISMATCH_CFG.get("cruise_small_threshold_deg_sec", 3.5))
+PERF_TRANSITION_FLOOR = float(PERF_MISMATCH_CFG.get("transition_floor_ft", 10000))
+PERF_TRANSITION_CEILING = float(PERF_MISMATCH_CFG.get("transition_ceiling_ft", 25000))
+PERF_MIN_CONSECUTIVE_SEC = int(PERF_MISMATCH_CFG.get("min_consecutive_seconds", 5))
+PERF_MIN_SPEED_KTS = float(PERF_MISMATCH_CFG.get("min_speed_kts", 100))
+
+# Identity mismatch PIM configuration (Rule 17)
+PIM_CFG = RULES.get("identity_mismatch_pim", {})
+PIM_CONSECUTIVE_SEC = int(PIM_CFG.get("consecutive_seconds", 30))
+PIM_LIGHT_MAX_SPEED = float(PIM_CFG.get("light_max_speed_kts", 220))
+PIM_LIGHT_MAX_CLIMB = float(PIM_CFG.get("light_max_climb_fpm", 2500))
+PIM_COMMERCIAL_MAX_SPEED_10K = float(PIM_CFG.get("commercial_max_speed_below_10k_kts", 350))
+PIM_COMMERCIAL_MAX_CLIMB = float(PIM_CFG.get("commercial_max_climb_fpm", 5500))
+PIM_HEAVY_MAX_SPEED_10K = float(PIM_CFG.get("heavy_max_speed_below_10k_kts", 350))
+PIM_HEAVY_MAX_CLIMB = float(PIM_CFG.get("heavy_max_climb_fpm", 5500))
+PIM_ROTORCRAFT_MAX_SPEED = float(PIM_CFG.get("rotorcraft_max_speed_kts", 200))
+PIM_ROTORCRAFT_MAX_CLIMB = float(PIM_CFG.get("rotorcraft_max_climb_fpm", 3500))
+PIM_BELOW_10K_FT = float(PIM_CFG.get("below_10k_ft", 10000))
+PIM_MILITARY_ICAO_CODES = set(PIM_CFG.get("military_icao_codes", []))
+
+# Endurance breach configuration (Rule 19)
+ETB_CFG = RULES.get("endurance_breach", {})
+ETB_ALERT_MULTIPLIER = float(ETB_CFG.get("alert_multiplier", 1.2))
+ETB_MAX_ENDURANCE_HOURS = ETB_CFG.get("max_endurance_hours", {})
+
+# Signal discontinuity configuration (Rule 20)
+ISD_CFG = RULES.get("signal_discontinuity", {})
+ISD_MIN_GAP_SEC = int(ISD_CFG.get("min_gap_seconds", 180))
+ISD_MIN_ALTITUDE_FT = float(ISD_CFG.get("min_altitude_ft", 3000))
+ISD_MIN_SPEED_KTS = float(ISD_CFG.get("min_speed_kts", 120))
+ISD_MIN_AIRPORT_DIST_NM = float(ISD_CFG.get("min_airport_distance_nm", 15.0))
+ISD_STABILITY_WINDOW_SEC = int(ISD_CFG.get("stability_window_seconds", 180))
+ISD_STABILITY_DEVIATION = float(ISD_CFG.get("stability_deviation_ratio", 0.05))
+
+# Commercial footprint absence configuration (Rule 21)
+CFA_CFG = RULES.get("commercial_footprint_absence", {})
+CFA_MIN_WEIGHT_CATEGORIES = set(CFA_CFG.get("min_weight_categories", ["Heavy", "Large"]))
+CFA_MILITARY_PREFIXES = set(CFA_CFG.get("military_callsign_prefixes",
+    ['MIL', 'IAF', 'USN', 'USA', 'RAF', 'RCH', 'CNV', 'NAV', 'ARM', 'AIR']))
+
+# ---------------------------------------------------------------------------
+# CFA airport data cache – lazy-loaded from airports.csv
+# Maps ICAO code -> { "iata_code": str|None, "scheduled_service": bool, "name": str }
+# ---------------------------------------------------------------------------
+_CFA_AIRPORT_DATA: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _load_cfa_airport_data() -> Dict[str, Dict[str, Any]]:
+    """Load airports.csv and return ICAO -> {iata_code, scheduled_service, name}."""
+    global _CFA_AIRPORT_DATA
+    if _CFA_AIRPORT_DATA is not None:
+        return _CFA_AIRPORT_DATA
+
+    _CFA_AIRPORT_DATA = {}
+    csv_path = PROJECT_ROOT / "docs" / "airports.csv"
+    if not csv_path.exists():
+        return _CFA_AIRPORT_DATA
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            icao = (row.get("icao_code") or "").strip().upper()
+            if not icao:
+                continue
+            iata = (row.get("iata_code") or "").strip().upper() or None
+            sched = (row.get("scheduled_service") or "").strip().lower() == "yes"
+            name = (row.get("name") or "").strip()
+            _CFA_AIRPORT_DATA[icao] = {
+                "iata_code": iata,
+                "scheduled_service": sched,
+                "name": name,
+            }
+
+    return _CFA_AIRPORT_DATA
+
+# Aircraft database cache
+_ACD_LOOKUP: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _load_aircraft_database(refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Load aircraft database from CSV file.
+    Returns dict keyed by ICAO_Code with FAA_Weight, Physical_Class_Engine, Manufacturer, Model_FAA.
+    """
+    global _ACD_LOOKUP
+    if _ACD_LOOKUP is not None and not refresh:
+        return _ACD_LOOKUP
+    
+    _ACD_LOOKUP = {}
+    csv_path = PERF_AIRCRAFT_DATA_CSV if PERF_AIRCRAFT_DATA_CSV.is_absolute() else (PROJECT_ROOT / PERF_AIRCRAFT_DATA_CSV)
+    
+    try:
+        if not csv_path.exists():
+            return _ACD_LOOKUP
+        
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                icao_code = row.get('ICAO_Code', '').strip()
+                if icao_code:
+                    _ACD_LOOKUP[icao_code] = {
+                        'FAA_Weight': row.get('FAA_Weight', '').strip(),
+                        'Physical_Class_Engine': row.get('Physical_Class_Engine', '').strip(),
+                        'Manufacturer': row.get('Manufacturer', '').strip(),
+                        'Model_FAA': row.get('Model_FAA', '').strip()
+                    }
+    except Exception:
+        _ACD_LOOKUP = {}
+    
+    return _ACD_LOOKUP
 
 
 def _load_learned_turns(refresh: bool = False) -> List[Dict[str, Any]]:
@@ -162,41 +276,11 @@ def _load_learned_turns(refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _load_learned_sid(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load learned SID procedures from PostgreSQL (or JSON file as fallback)."""
+    """Load learned SID procedures from JSON file."""
     global _LEARNED_SID_CACHE
     if _LEARNED_SID_CACHE is not None and not refresh:
         return _LEARNED_SID_CACHE
     
-    # Try loading from PostgreSQL first
-    if _PG_AVAILABLE:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, airport, type, centerline, width_nm, member_count, runway
-                        FROM learned_sids
-                        ORDER BY member_count DESC
-                    """)
-                    rows = cursor.fetchall()
-                    
-                    _LEARNED_SID_CACHE = []
-                    for row in rows:
-                        _LEARNED_SID_CACHE.append({
-                            "id": row[0],
-                            "airport": row[1],
-                            "type": row[2],
-                            "centerline": json.loads(row[3]) if isinstance(row[3], str) else row[3],
-                            "width_nm": row[4],
-                            "member_count": row[5],
-                            "runway": row[6]
-                        })
-                    
-                    logger.info(f"Loaded {len(_LEARNED_SID_CACHE)} SIDs from PostgreSQL")
-                    return _LEARNED_SID_CACHE
-        except Exception as e:
-            logger.warning(f"Failed to load SIDs from PostgreSQL, falling back to JSON: {e}")
-    
-    # Fallback to JSON file
     try:
         if LEARNED_SID_FILE.exists():
             with open(LEARNED_SID_FILE, "r", encoding="utf-8") as f:
@@ -211,41 +295,11 @@ def _load_learned_sid(refresh: bool = False) -> List[Dict[str, Any]]:
 
 
 def _load_learned_star(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load learned STAR procedures from PostgreSQL (or JSON file as fallback)."""
+    """Load learned STAR procedures from JSON file."""
     global _LEARNED_STAR_CACHE
     if _LEARNED_STAR_CACHE is not None and not refresh:
         return _LEARNED_STAR_CACHE
     
-    # Try loading from PostgreSQL first
-    if _PG_AVAILABLE:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, airport, type, centerline, width_nm, member_count, runway
-                        FROM learned_stars
-                        ORDER BY member_count DESC
-                    """)
-                    rows = cursor.fetchall()
-                    
-                    _LEARNED_STAR_CACHE = []
-                    for row in rows:
-                        _LEARNED_STAR_CACHE.append({
-                            "id": row[0],
-                            "airport": row[1],
-                            "type": row[2],
-                            "centerline": json.loads(row[3]) if isinstance(row[3], str) else row[3],
-                            "width_nm": row[4],
-                            "member_count": row[5],
-                            "runway": row[6]
-                        })
-                    
-                    logger.info(f"Loaded {len(_LEARNED_STAR_CACHE)} STARs from PostgreSQL")
-                    return _LEARNED_STAR_CACHE
-        except Exception as e:
-            logger.warning(f"Failed to load STARs from PostgreSQL, falling back to JSON: {e}")
-    
-    # Fallback to JSON file
     try:
         if LEARNED_STAR_FILE.exists():
             with open(LEARNED_STAR_FILE, "r", encoding="utf-8") as f:
@@ -307,7 +361,6 @@ def _load_learned_tubes(refresh: bool = False) -> List[Dict[str, Any]]:
         _LEARNED_TUBES_CACHE = []
     
     return _LEARNED_TUBES_CACHE
-
 
 
 def _get_tubes_for_od(
@@ -428,45 +481,11 @@ _LEARNED_OD_PATHS_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
 def _load_learned_od_paths(refresh: bool = False) -> List[Dict[str, Any]]:
-    """Load O/D-based learned paths from PostgreSQL (or JSON file as fallback)."""
+    """Load O/D-based learned paths from the new format."""
     global _LEARNED_OD_PATHS_CACHE
     if _LEARNED_OD_PATHS_CACHE is not None and not refresh:
         return _LEARNED_OD_PATHS_CACHE
     
-    # Try loading from PostgreSQL first
-    if _PG_AVAILABLE:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, origin, destination, centerline, width_nm, member_count,
-                               min_alt_ft, max_alt_ft
-                        FROM learned_paths
-                        ORDER BY member_count DESC
-                    """)
-                    rows = cursor.fetchall()
-                    
-                    _LEARNED_OD_PATHS_CACHE = []
-                    for row in rows:
-                        centerline = json.loads(row[3]) if isinstance(row[3], str) else row[3]
-                        _LEARNED_OD_PATHS_CACHE.append({
-                            "id": row[0],
-                            "type": "od_learned",
-                            "origin": row[1],
-                            "destination": row[2],
-                            "centerline": centerline,
-                            "width_nm": row[4],
-                            "num_flights": row[5],
-                            "min_alt_ft": row[6],
-                            "max_alt_ft": row[7]
-                        })
-                    
-                    logger.info(f"Loaded {len(_LEARNED_OD_PATHS_CACHE)} paths from PostgreSQL")
-                    return _LEARNED_OD_PATHS_CACHE
-        except Exception as e:
-            logger.warning(f"Failed to load paths from PostgreSQL, falling back to JSON: {e}")
-    
-    # Fallback to JSON file
     try:
         if LEARNED_PATHS_FILE.exists():
             with open(LEARNED_PATHS_FILE, "r", encoding="utf-8") as f:
@@ -908,6 +927,64 @@ AIRPORTS: List[Airport] = [Airport(**entry) for entry in AIRPORT_ENTRIES]
 AIRPORT_BY_CODE: Dict[str, Airport] = {a.code: a for a in AIRPORTS}
 
 
+# ---------------------------------------------------------------------------
+# Comprehensive airport lookup from airports.csv (lazy-loaded)
+# Keys: ICAO code, IATA code, and ident – all uppercased
+# Values: dict with "lat" and "lon"
+# ---------------------------------------------------------------------------
+_CSV_AIRPORT_COORDS: Optional[Dict[str, Dict[str, float]]] = None
+
+
+def _get_csv_airport_coords() -> Dict[str, Dict[str, float]]:
+    """Load airports.csv once and return a code -> {lat, lon} lookup."""
+    global _CSV_AIRPORT_COORDS
+    if _CSV_AIRPORT_COORDS is not None:
+        return _CSV_AIRPORT_COORDS
+
+    _CSV_AIRPORT_COORDS = {}
+    csv_path = PROJECT_ROOT / "docs" / "airports.csv"
+    if not csv_path.exists():
+        return _CSV_AIRPORT_COORDS
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                lat = float(row["latitude_deg"])
+                lon = float(row["longitude_deg"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            coords = {"lat": lat, "lon": lon}
+            ident = (row.get("ident") or "").strip().upper()
+            icao = (row.get("icao_code") or "").strip().upper()
+            iata = (row.get("iata_code") or "").strip().upper()
+            if ident:
+                _CSV_AIRPORT_COORDS[ident] = coords
+            if icao:
+                _CSV_AIRPORT_COORDS[icao] = coords
+            if iata:
+                _CSV_AIRPORT_COORDS[iata] = coords
+
+    return _CSV_AIRPORT_COORDS
+
+
+def _resolve_airport_coords(code: Optional[str]) -> Optional[Tuple[float, float]]:
+    """Return (lat, lon) for an airport code, or None if not found."""
+    if not code:
+        return None
+    code_upper = code.strip().upper()
+    # Try rule-config airports first (local / curated)
+    if code_upper in AIRPORT_BY_CODE:
+        ap = AIRPORT_BY_CODE[code_upper]
+        return (ap.lat, ap.lon)
+    # Fall back to the comprehensive CSV
+    lookup = _get_csv_airport_coords()
+    entry = lookup.get(code_upper)
+    if entry:
+        return (entry["lat"], entry["lon"])
+    return None
+
+
 def is_bad_segment(prev: TrackPoint, curr: TrackPoint) -> bool:
     dt = curr.timestamp - prev.timestamp
     if dt <= 0:
@@ -1076,10 +1153,318 @@ def is_impossible_point(
     return False
 
 
+def _rule_endurance_breach(ctx: RuleContext) -> RuleResult:
+    """
+    Detect Endurance vs. Type Breach (Rule 19 - ETB).
+    
+    This rule identifies aircraft staying airborne for prolonged periods significantly exceeding
+    the physical maximum capability (Max Endurance) of the aircraft model declared in ADS-B.
+    
+    Logic:
+    1. Get aircraft_type from metadata
+    2. Look up max endurance from hardcoded table
+    3. Calculate flight duration from first to last point
+    4. If duration > max_endurance * alert_multiplier, trigger anomaly
+    """
+    points = ctx.track.sorted_points()
+    if not points or len(points) < 2:
+        return RuleResult(19, False, "Insufficient track data", {})
+    
+    # Check if aircraft_type is available
+    if not ctx.metadata or not ctx.metadata.aircraft_type:
+        return RuleResult(19, False, "Aircraft type not available", {})
+    
+    aircraft_type = ctx.metadata.aircraft_type.upper()
+    
+    # Look up max endurance
+    if aircraft_type not in ETB_MAX_ENDURANCE_HOURS:
+        return RuleResult(19, False, f"Max endurance unknown for {aircraft_type}", 
+                         {"aircraft_type": aircraft_type})
+    
+    max_endurance_hours = ETB_MAX_ENDURANCE_HOURS[aircraft_type]
+    threshold_hours = max_endurance_hours * ETB_ALERT_MULTIPLIER
+    
+    # Calculate flight duration
+    duration_seconds = points[-1].timestamp - points[0].timestamp
+    duration_hours = duration_seconds / 3600.0
+    
+    if duration_hours > threshold_hours:
+        exceedance_pct = ((duration_hours - threshold_hours) / threshold_hours) * 100
+        summary = f"Endurance breach: {aircraft_type} flew {duration_hours:.1f}h exceeding {threshold_hours:.1f}h limit ({exceedance_pct:.0f}% over)"
+        details = {
+            "aircraft_type": aircraft_type,
+            "duration_hours": round(duration_hours, 2),
+            "max_endurance_hours": max_endurance_hours,
+            "threshold_hours": round(threshold_hours, 2),
+            "exceedance_pct": round(exceedance_pct, 1),
+            "first_seen": points[0].timestamp,
+            "last_seen": points[-1].timestamp,
+            "first_location": {"lat": points[0].lat, "lon": points[0].lon},
+            "last_location": {"lat": points[-1].lat, "lon": points[-1].lon}
+        }
+        return RuleResult(19, True, summary, details)
+    else:
+        return RuleResult(19, False, "Flight duration within normal limits", {
+            "aircraft_type": aircraft_type,
+            "duration_hours": round(duration_hours, 2),
+            "threshold_hours": round(threshold_hours, 2)
+        })
+
+
+def _rule_signal_discontinuity(ctx: RuleContext) -> RuleResult:
+    """
+    Detect In-Flight Signal Discontinuity (Rule 20 - ISD).
+    
+    This rule identifies events where an aircraft stops transmitting ADS-B data while airborne,
+    provided there is proof of proper coverage in the area (simplified version without neighbor correlation).
+    
+    Logic:
+    1. Scan sorted track points for time gaps > min_gap_seconds
+    2. For each gap, check the LAST point before the gap:
+       - Altitude > min_altitude_ft
+       - Speed > min_speed_kts
+       - Distance from any airport > min_airport_distance_nm
+    3. Check stability: speed/altitude deviation < 5% in the window before disappearance
+    4. If all conditions met, flag as "Tactical Signal Dropout"
+    """
+    points = ctx.track.sorted_points()
+    if not points or len(points) < 2:
+        return RuleResult(20, False, "Insufficient track data", {})
+    
+    gaps = []
+    
+    for i in range(1, len(points)):
+        p_prev = points[i - 1]
+        p_curr = points[i]
+        
+        gap_duration = p_curr.timestamp - p_prev.timestamp
+        
+        if gap_duration >= ISD_MIN_GAP_SEC:
+            # Check conditions on the last point before gap
+            altitude = p_prev.alt or 0
+            speed = p_prev.gspeed or 0
+            
+            if altitude < ISD_MIN_ALTITUDE_FT:
+                continue
+            if speed < ISD_MIN_SPEED_KTS:
+                continue
+            
+            # Check distance from nearest airport
+            nearest_airport, airport_distance = _nearest_airport(p_prev)
+            if airport_distance < ISD_MIN_AIRPORT_DIST_NM:
+                continue
+            
+            # Check stability in the window before disappearance
+            stability_start = p_prev.timestamp - ISD_STABILITY_WINDOW_SEC
+            stable_points = [p for p in points[:i] if p.timestamp >= stability_start]
+            
+            if len(stable_points) < 2:
+                continue
+            
+            # Calculate speed and altitude deviation
+            speeds = [p.gspeed for p in stable_points if p.gspeed is not None]
+            altitudes = [p.alt for p in stable_points if p.alt is not None]
+            
+            if not speeds or not altitudes:
+                continue
+            
+            avg_speed = sum(speeds) / len(speeds)
+            avg_altitude = sum(altitudes) / len(altitudes)
+            
+            speed_deviation = max(abs(s - avg_speed) / avg_speed for s in speeds) if avg_speed > 0 else 0
+            altitude_deviation = max(abs(a - avg_altitude) / avg_altitude for a in altitudes) if avg_altitude > 0 else 0
+            
+            if speed_deviation > ISD_STABILITY_DEVIATION or altitude_deviation > ISD_STABILITY_DEVIATION:
+                continue
+            
+            # All conditions met - this is a suspicious gap
+            gaps.append({
+                "timestamp_before": p_prev.timestamp,
+                "timestamp_after": p_curr.timestamp,
+                "gap_duration_sec": gap_duration,
+                "altitude_ft": altitude,
+                "speed_kts": speed,
+                "nearest_airport": nearest_airport.code if nearest_airport else "Unknown",
+                "airport_distance_nm": round(airport_distance, 2),
+                "lat": p_prev.lat,
+                "lon": p_prev.lon,
+                "speed_deviation": round(speed_deviation, 3),
+                "altitude_deviation": round(altitude_deviation, 3)
+            })
+    
+    if gaps:
+        total_gap_time = sum(g["gap_duration_sec"] for g in gaps)
+        summary = f"Tactical signal dropout detected: {len(gaps)} suspicious gap(s) totaling {total_gap_time//60:.0f} minutes"
+        details = {
+            "gap_count": len(gaps),
+            "total_gap_seconds": total_gap_time,
+            "gaps": gaps[:5] if len(gaps) > 5 else gaps  # Limit to first 5
+        }
+        return RuleResult(20, True, summary, details)
+    else:
+        return RuleResult(20, False, "No suspicious signal discontinuities detected", {})
+
+
+def _rule_commercial_footprint_absence(ctx: RuleContext) -> RuleResult:
+    """
+    Detect Commercial Footprint Absence (Rule 21 - CFA).
+
+    Exposes "shadow flights" by checking whether an airport used by a heavy/large
+    aircraft with a commercial callsign actually exists in the civilian aviation
+    world.  Uses a **Double-Lock** mechanism:
+
+        1. **IATA Test (Bureaucratic Identity):**
+           Does the airport hold a 3-letter IATA code?  Military bases usually
+           only have a 4-letter ICAO code.
+
+        2. **Schedule Test (Operational Activity):**
+           Does the airport have *any* regularly scheduled commercial service?
+           (sourced from the ``scheduled_service`` field in airports.csv)
+
+    Anomaly Hierarchy:
+        * **Critical (severity 5):**  Airport has NO IATA code *and* no scheduled
+          service → indicates a closed military base.
+        * **High (severity 4):**  Airport HAS an IATA code (e.g. Nevatim = VTM)
+          but its scheduled service is empty → logistical / military base used
+          for "shadow" flights.
+
+    Pre-conditions (must all pass before the Double-Lock is evaluated):
+        - Aircraft weight category is Heavy or Large (from ACD CSV).
+        - Callsign looks commercial (3-letter alphabetic airline prefix, not in
+          the known military-prefix list).
+    """
+    points = ctx.track.sorted_points()
+    if not points:
+        return RuleResult(21, False, "No track data", {})
+
+    # --- Pre-condition 1: aircraft type & weight --------------------------
+    if not ctx.metadata or not ctx.metadata.aircraft_type:
+        return RuleResult(21, False, "Aircraft type not available", {})
+
+    aircraft_type = ctx.metadata.aircraft_type.upper()
+
+    acd_db = _load_aircraft_database()
+    if aircraft_type not in acd_db:
+        return RuleResult(21, False,
+                          f"Aircraft type {aircraft_type} not found in database",
+                          {"aircraft_type": aircraft_type})
+
+    aircraft_info = acd_db[aircraft_type]
+    faa_weight = aircraft_info['FAA_Weight']
+
+    if faa_weight not in CFA_MIN_WEIGHT_CATEGORIES:
+        return RuleResult(21, False,
+                          f"Weight category {faa_weight} not monitored for this rule",
+                          {"aircraft_type": aircraft_type, "faa_weight": faa_weight})
+
+    # --- Pre-condition 2: commercial-looking callsign ---------------------
+    callsign = points[0].callsign if points[0].callsign else ""
+    if len(callsign) < 3:
+        return RuleResult(21, False, "Callsign unavailable or too short",
+                          {"callsign": callsign})
+
+    airline_prefix = callsign[:3].upper()
+    is_commercial_callsign = (airline_prefix.isalpha()
+                              and airline_prefix not in CFA_MILITARY_PREFIXES)
+
+    if not is_commercial_callsign:
+        return RuleResult(21, False, "Callsign does not appear commercial",
+                          {"callsign": callsign, "airline_prefix": airline_prefix})
+
+    # --- Double-Lock evaluation on origin & destination -------------------
+    airport_db = _load_cfa_airport_data()
+
+    def _check_airport(icao_code: Optional[str], role: str) -> Optional[Dict[str, Any]]:
+        """
+        Apply the Double-Lock to a single airport.
+        Returns a finding dict if anomalous, else None.
+        """
+        if not icao_code:
+            return None
+
+        icao_upper = icao_code.strip().upper()
+        info = airport_db.get(icao_upper)
+
+        if info is None:
+            # Airport not in our CSV at all – unknown field, treat as
+            # critical (no IATA, no schedule evidence).
+            return {
+                "role": role,
+                "icao": icao_upper,
+                "airport_name": None,
+                "has_iata": False,
+                "iata_code": None,
+                "has_scheduled_service": False,
+                "severity": "critical",
+            }
+
+        has_iata = info["iata_code"] is not None
+        has_schedule = info["scheduled_service"]
+
+        if has_iata and has_schedule:
+            return None  # Legitimate civilian airport – pass
+
+        severity = "critical" if (not has_iata and not has_schedule) else "high"
+        return {
+            "role": role,
+            "icao": icao_upper,
+            "airport_name": info["name"],
+            "has_iata": has_iata,
+            "iata_code": info["iata_code"],
+            "has_scheduled_service": has_schedule,
+            "severity": severity,
+        }
+
+    findings: List[Dict[str, Any]] = []
+
+    origin_finding = _check_airport(ctx.metadata.origin, "origin")
+    if origin_finding:
+        findings.append(origin_finding)
+
+    dest_finding = _check_airport(ctx.metadata.planned_destination, "destination")
+    if dest_finding:
+        findings.append(dest_finding)
+
+    if not findings:
+        return RuleResult(21, False, "Origin and destination pass civilian checks", {
+            "aircraft_type": aircraft_type,
+            "faa_weight": faa_weight,
+            "callsign": callsign,
+            "origin": ctx.metadata.origin,
+            "destination": ctx.metadata.planned_destination,
+        })
+
+    # --- Build result -----------------------------------------------------
+    # Overall severity: critical if any finding is critical, else high
+    worst = "critical" if any(f["severity"] == "critical" for f in findings) else "high"
+
+    parts = []
+    for f in findings:
+        iata_status = f"IATA={f['iata_code']}" if f["has_iata"] else "no IATA code"
+        sched_status = "has scheduled service" if f["has_scheduled_service"] else "no scheduled service"
+        parts.append(f"{f['icao']} ({f['role']}, {iata_status}, {sched_status})")
+
+    airports_str = "; ".join(parts)
+    summary = (f"Unauthorized commercial route: {aircraft_type} ({faa_weight}) "
+               f"with callsign {callsign} at non-civilian airport(s): {airports_str}")
+
+    details = {
+        "aircraft_type": aircraft_type,
+        "faa_weight": faa_weight,
+        "callsign": callsign,
+        "airline_prefix": airline_prefix,
+        "origin": ctx.metadata.origin,
+        "destination": ctx.metadata.planned_destination,
+        "severity_level": worst,
+        "findings": findings,
+    }
+    return RuleResult(21, True, summary, details)
+
+
 def evaluate_rule(context: RuleContext, rule_id: int) -> RuleResult:
     evaluators = {
         1: _rule_emergency_squawk,
-        2: _rule_extreme_altitude_change,
+        # 2: _rule_extreme_altitude_change,
         3: _rule_abrupt_turn,
         4: _rule_dangerous_proximity,
         6: _rule_go_around,
@@ -1090,6 +1475,13 @@ def evaluate_rule(context: RuleContext, rule_id: int) -> RuleResult:
         # 12: _rule_unplanned_israel_landing,
         11: _rule_off_course,
         13: _rule_military_aircraft,
+        14: _rule_circular_flight,
+        15: _rule_distance_trend_diversion,
+        16: _rule_performance_mismatch,
+        17: _rule_identity_mismatch_pim,
+        19: _rule_endurance_breach,
+        # 20: _rule_signal_discontinuity,
+        # 21: _rule_commercial_footprint_absence,
     }
     evaluator = evaluators.get(rule_id)
     if evaluator is None:
@@ -1421,16 +1813,13 @@ def _rule_abrupt_turn(ctx: RuleContext) -> RuleResult:
             if dt <= 0:
                 continue
             
-            # --- NEW: Ignore points descending within 5 miles of an airport at low altitude ---
-            # Only suppress maneuvers that are clearly approach/landing related (below 2000ft AGL).
-            # 360-degree orbits at cruise altitude near airports are still anomalous.
+            # --- NEW: Ignore points descending within 5 miles of an airport ---
+            # Even if above TURN_MIN_ALT, we ignore descent segments near airports
+            # as they often involve maneuvering that isn't a "holding pattern" anomaly.
             nearest_ap, dist_ap = _nearest_airport(p1)
-            if dist_ap is not None and dist_ap < 5.0 and nearest_ap:
-                # Calculate AGL (Above Ground Level)
-                airport_elev = nearest_ap.elevation_ft or 0
-                agl = (p1.alt or 0) - airport_elev
-                # Only suppress if descending AND below 2000ft AGL (clearly in approach phase)
-                if (p1.alt or 0) < (p0.alt or 0) and agl < 2000:
+            if dist_ap is not None and dist_ap < 5.0:
+                # Check if descending
+                if (p1.alt or 0) < (p0.alt or 0):
                     continue
 
             # --- High Density Logic ---
@@ -1530,26 +1919,29 @@ def _rule_abrupt_turn(ctx: RuleContext) -> RuleResult:
                     continue  # Not an orbit - aircraft traveled away from start
                 
                 # If path/displacement ratio is low, it's not really an orbit
-                # Relaxed threshold: 1.5 (down from 2.0) since 320+ degree cumulative turns
-                # are rare enough that this won't cause many false positives
-                if displacement_nm > 0 and path_nm / displacement_nm < 1.5:
+                if displacement_nm > 0 and path_nm / displacement_nm < 2.0:
                     continue  # Not looping back - just a curved path
                 
-                # For 360-degree orbits (full circles), be LESS aggressive with suppression
-                # A complete 360 orbit with 320+ cumulative turn is inherently suspicious,
-                # even if near an airport. Only suppress if VERY close (< 2nm) to airport
-                # AND clearly in approach phase (< 1000ft AGL).
+                # Suppress if very close to an airport (likely a hold for landing)
                 nearest_ap, dist_ap = _nearest_airport(p1)
+                near_airport = dist_ap is not None and dist_ap < 6.0
                 
-                # Check if this is clearly a hold/approach pattern (very close + very low)
-                is_approach_hold = False
-                if nearest_ap and dist_ap and dist_ap < 2.0:
-                    airport_elev = nearest_ap.elevation_ft or 0
-                    agl = (p1.alt or 0) - airport_elev
-                    if agl < 1000:  # Very low - clearly in approach
-                        is_approach_hold = True
-                
-                if not is_approach_hold:
+                # NEW: Suppress go-around patterns - check if ANY point in the pattern
+                # was close to an airport at low altitude (approach-related maneuver)
+                is_go_around_pattern = False
+                pattern_points = points[start_idx:end_idx + 1]
+                for pp in pattern_points:
+                    pp_ap, pp_dist = _nearest_airport(pp)
+                    if pp_ap and pp_dist is not None:
+                        pp_elev = pp_ap.elevation_ft or 0
+                        pp_agl = (pp.alt or 0) - pp_elev
+                        # If any point was within 5nm of airport at low altitude (< 2000ft AGL)
+                        # this looks like an approach/go-around, not a suspicious holding pattern
+                        if pp_dist < 5.0 and pp_agl < 2000:
+                            is_go_around_pattern = True
+                            break
+
+                if not near_airport and not is_go_around_pattern:
                     events.append({
                         "type": "holding_pattern",
                         "timestamp": p1.timestamp,
@@ -1955,9 +2347,6 @@ RUNWAY_HEADINGS = {
 
 def _heading_diff(h1, h2):
     """Smallest circular difference between two headings."""
-    # Handle None values - if either heading is missing, return max difference
-    if h1 is None or h2 is None:
-        return 360
     diff = abs(h1 - h2) % 360
     return diff if diff <= 180 else 360 - diff
 
@@ -2078,6 +2467,13 @@ def _rule_takeoff_return(ctx: RuleContext) -> RuleResult:
         return RuleResult(7, False, "Origin airport unknown", {})
 
     origin_elev = (origin_airport.elevation_ft or 0)
+    
+    # Check if first point is actually on the ground (within 10 ft of airport elevation)
+    # This prevents false positives when flight enters bbox at cruise altitude
+    first_point_alt = points[0].alt or 0
+    if first_point_alt > origin_elev + 10:
+        return RuleResult(7, False, f"First point at {first_point_alt:.0f} ft - not a ground departure (bbox entry at cruise)", 
+                         {"first_point_alt_ft": round(first_point_alt, 1), "origin_elev_ft": origin_elev})
 
     takeoff_point = next((p for p in points if (p.alt or 0) >= origin_elev + RETURN_TAKEOFF_ALT_FT), None)
     if takeoff_point is None:
@@ -2092,6 +2488,9 @@ def _rule_takeoff_return(ctx: RuleContext) -> RuleResult:
     if max_outbound_nm < RETURN_MIN_OUTBOUND_NM:
         return RuleResult(7, False, "No meaningful outbound leg", {"max_outbound_nm": max_outbound_nm})
 
+    # Store the first point for start-to-end distance check
+    first_point = points[0]
+
     for i, point in enumerate(points):
         # Physics check: skip impossible points (GPS glitches)
         if is_impossible_point(points, i):
@@ -2105,12 +2504,19 @@ def _rule_takeoff_return(ctx: RuleContext) -> RuleResult:
         if (point.alt or 0) < origin_elev + RETURN_LANDING_ALT_FT and distance_home <= RETURN_NEAR_AIRPORT_NM:
             dt = point.timestamp - takeoff_point.timestamp
             if dt <= RETURN_TIME_LIMIT_SECONDS and dt >= RETURN_MIN_ELAPSED_SECONDS:
+                # Additional check: verify the distance between starting point and landing point is less than 8 nm
+                # This ensures it's truly a "return to land" and not a flight that started and ended at different locations
+                start_to_end_distance = haversine_nm(first_point.lat, first_point.lon, point.lat, point.lon)
+                if start_to_end_distance >= 8.0:
+                    continue  # Not a true return to land - ended too far from start
+                
                 info = {
                     "airport": origin_airport.code,
                     "takeoff_ts": takeoff_point.timestamp,
                     "landing_ts": point.timestamp,
                     "elapsed_s": dt,
                     "max_outbound_nm": max_outbound_nm,
+                    "start_to_end_distance_nm": round(start_to_end_distance, 2),
                 }
                 return RuleResult(7, True, "Return-to-field detected", info)
     return RuleResult(7, False, "No immediate return detected", {})
@@ -2562,7 +2968,7 @@ def _rule_off_course(ctx: RuleContext) -> RuleResult:
 
         if idx > 0 and is_bad_segment(points[idx - 1], p):
             continue
-        if (p.alt or 0) <= 9000:
+        if (p.alt or 0) <= OFF_COURSE_MIN_ALTITUDE_FT:
             continue
 
         # Try tube-based checking first (faster and more accurate)
@@ -2622,6 +3028,7 @@ def _rule_off_course(ctx: RuleContext) -> RuleResult:
 
     return RuleResult(11, matched, summary, details)
 
+
 def _points_near_airport(points: Sequence[TrackPoint], airport: Airport, radius_nm: float) -> List[TrackPoint]:
     return [p for p in points if haversine_nm(p.lat, p.lon, airport.lat, airport.lon) <= radius_nm]
 
@@ -2629,11 +3036,20 @@ def _points_near_airport(points: Sequence[TrackPoint], airport: Airport, radius_
 def _nearest_airport(point: TrackPoint) -> Tuple[Optional[Airport], float]:
     best_airport: Optional[Airport] = None
     best_distance: float = float('inf')
+    # Search curated rule-config airports first
     for airport in AIRPORTS:
         distance = haversine_nm(point.lat, point.lon, airport.lat, airport.lon)
         if distance < best_distance:
             best_distance = distance
             best_airport = airport
+    # Fallback: if no airport found within a reasonable range, search airports.csv
+    if best_airport is None or best_distance > 30:
+        csv_lookup = _get_csv_airport_coords()
+        for code, coords in csv_lookup.items():
+            distance = haversine_nm(point.lat, point.lon, coords["lat"], coords["lon"])
+            if distance < best_distance:
+                best_distance = distance
+                best_airport = Airport(code=code, name=code, lat=coords["lat"], lon=coords["lon"])
     return best_airport, best_distance
 
 
@@ -2711,3 +3127,613 @@ def _rule_military_aircraft(ctx: RuleContext) -> RuleResult:
         return RuleResult(13, True, summary, details)
     
     return RuleResult(13, False, "No military identification", {"callsign": callsign})
+
+
+def _rule_circular_flight(ctx: RuleContext) -> RuleResult:
+    """
+    Detect non-commercial off-route circular flights.
+    
+    This rule identifies aircraft not classified as commercial passenger/cargo planes,
+    performing takeoff and return to land at the same airport (or in its immediate vicinity),
+    without a flight plan to another destination.
+    
+    Conditions:
+    - Classification: Aircraft category is not "Commercial" (e.g., training, light, military)
+    - Route Deviation: Aircraft is outside known aviation routes for over 60% of flight time
+    - Circle Closure: Distance between takeoff and landing < 5 NM
+    - Duration: Flight time > 15 minutes (to exclude technical malfunctions)
+    """
+    points = ctx.track.sorted_points()
+    if not points:
+        return RuleResult(14, False, "No track data", {})
+    
+    # 1. Skip only if category is explicitly commercial (passenger/cargo)
+    #    If category is None/unknown, still run the rule.
+    COMMERCIAL_CATEGORIES = ["passenger", "cargo"]
+    category = ctx.metadata.category if ctx.metadata else None
+    
+    if category:
+        is_commercial = any(comm.lower() in category.lower() for comm in COMMERCIAL_CATEGORIES)
+        if is_commercial:
+            return RuleResult(14, False, f"Aircraft is commercial category: {category}", {"category": category})
+    
+    # 2. Check if first point is near ground level (within 10 ft of surface)
+    #    This prevents false positives when flight enters bbox at cruise altitude
+    first_point = points[0]
+    first_alt = first_point.alt or 0
+    
+    # Find nearest airport to first point to get ground elevation
+    first_airport, first_dist = _nearest_airport(first_point)
+    if first_airport:
+        first_elev = first_airport.elevation_ft or 0
+        if first_alt > first_elev + 10:
+            return RuleResult(14, False, f"First point at {first_alt:.0f} ft - not a ground departure (bbox entry at cruise)",
+                             {"first_point_alt_ft": round(first_alt, 1), "ground_elev_ft": first_elev})
+    else:
+        # No airport nearby - use absolute altitude check
+        if first_alt > 1000:
+            return RuleResult(14, False, f"First point at {first_alt:.0f} ft - not a ground departure (bbox entry at cruise)",
+                             {"first_point_alt_ft": round(first_alt, 1)})
+    
+    # 3. Check flight duration > 15 minutes (900 seconds)
+    first_ts = points[0].timestamp
+    last_ts = points[-1].timestamp
+    duration_sec = last_ts - first_ts
+    
+    if duration_sec < CIRCULAR_MIN_DURATION_SEC:
+        return RuleResult(14, False, f"Flight duration too short: {duration_sec}s (need {CIRCULAR_MIN_DURATION_SEC}s)", 
+                         {"duration_sec": duration_sec})
+    
+    # 4. Check circle closure: distance between first and last point < 5 NM
+    last_point = points[-1]
+    closure_distance = haversine_nm(first_point.lat, first_point.lon, last_point.lat, last_point.lon)
+    
+    if closure_distance > CIRCULAR_MAX_CLOSURE_NM:
+        return RuleResult(14, False, f"Not a circular flight: closure distance {closure_distance:.2f} NM (need < {CIRCULAR_MAX_CLOSURE_NM} NM)",
+                         {"closure_distance_nm": round(closure_distance, 2)})
+    
+    # 5. Check that we have valid high-altitude points
+    valid_points = 0
+    for p in points:
+        if (p.alt or 0) > CIRCULAR_MIN_ALTITUDE_FT:
+            valid_points += 1
+    
+    if valid_points == 0:
+        return RuleResult(14, False, "No valid high-altitude points to analyze", {})
+    
+    # All conditions met - this is a circular surveillance flight
+    summary = f"Circular flight detected: {category or 'unknown'} category, {duration_sec//60}min duration, {closure_distance:.1f} NM closure"
+    details = {
+        "category": category,
+        "duration_sec": duration_sec,
+        "duration_min": round(duration_sec / 60, 1),
+        "closure_distance_nm": round(closure_distance, 2),
+        "valid_altitude_points": valid_points,
+        "total_points": len(points),
+        "start_lat": first_point.lat,
+        "start_lon": first_point.lon,
+        "end_lat": last_point.lat,
+        "end_lon": last_point.lon
+    }
+    
+    return RuleResult(14, True, summary, details)
+
+
+def _rule_distance_trend_diversion(ctx: RuleContext) -> RuleResult:
+    """
+    Detect distance trend diversion (DTD).
+    
+    This rule identifies consistent geographic distancing from the original destination airport,
+    distinguishing between holding patterns and actual diversions.
+    
+    Two detection modes:
+    A. Real-time: 5-minute window where distance increases in >= 80% of samples
+    B. Post-landing backup: Landing > 20 NM from destination (not at origin)
+    """
+    points = ctx.track.sorted_points()
+    if not points:
+        return RuleResult(15, False, "No track data", {})
+    
+    if not ctx.metadata:
+        return RuleResult(15, False, "No metadata available", {})
+
+    origin = ctx.metadata.origin
+    destination = ctx.metadata.planned_destination
+
+    # Resolve destination coordinates:
+    # 1. If we have a destination airport code, look it up from airports.csv
+    #    (this gives the *actual* airport location, not the last track point).
+    # 2. Fall back to metadata dest_lat/dest_lon only if the CSV lookup fails.
+    dest_lat: Optional[float] = None
+    dest_lon: Optional[float] = None
+
+    if destination:
+        resolved = _resolve_airport_coords(destination)
+        if resolved:
+            dest_lat, dest_lon = resolved
+
+
+
+    if not dest_lat or not dest_lon:
+        return RuleResult(15, False, "Destination coordinates not available", {})
+    
+    # Cruise filter: Check if aircraft passed FL180 (18,000 ft) at any point
+    passed_fl180 = any((p.alt or 0) >= DTD_MIN_CRUISE_ALT_FT for p in points)
+    
+    # MODE A: Real-time distance trend detection
+    trend_detected = False
+    trend_start_ts = None
+    trend_end_ts = None
+    increasing_samples = 0
+    total_samples = 0
+    
+    if passed_fl180:
+        # Sample points every DTD_SAMPLE_INTERVAL_SEC (10 seconds)
+        # Check for 5-minute windows where distance increases consistently
+        # Only consider points above FL180 – below that the aircraft is in
+        # approach/landing phase and lateral deviations toward a specific
+        # runway are expected and normal.
+        
+        for i in range(len(points)):
+            p = points[i]
+            
+            # Skip impossible points
+            if is_impossible_point(points, i):
+                continue
+            
+            # Skip points below FL180 (approach/landing phase)
+            if (p.alt or 0) < DTD_MIN_CRUISE_ALT_FT:
+                continue
+            
+            # Look ahead for a 5-minute window
+            window_start_ts = p.timestamp
+            window_end_ts = window_start_ts + DTD_CHECK_WINDOW_SEC
+            
+            # Collect samples in this window
+            window_samples = []
+            for j in range(i, len(points)):
+                if points[j].timestamp > window_end_ts:
+                    break
+                if is_impossible_point(points, j):
+                    continue
+                # Skip points below FL180 inside the window as well
+                if (points[j].alt or 0) < DTD_MIN_CRUISE_ALT_FT:
+                    continue
+                # Sample every ~10 seconds
+                if len(window_samples) == 0 or (points[j].timestamp - window_samples[-1][0]) >= DTD_SAMPLE_INTERVAL_SEC:
+                    dist = haversine_nm(points[j].lat, points[j].lon, dest_lat, dest_lon)
+                    window_samples.append((points[j].timestamp, dist))
+            
+            # Analyze this window: count how many samples show increasing distance
+            if len(window_samples) >= 3:  # Need at least 3 samples
+                increasing = 0
+                for k in range(1, len(window_samples)):
+                    if window_samples[k][1] > window_samples[k-1][1]:
+                        increasing += 1
+                
+                increasing_ratio = increasing / (len(window_samples) - 1)
+                
+                if increasing_ratio >= DTD_MIN_INCREASING_RATIO:
+                    trend_detected = True
+                    trend_start_ts = window_samples[0][0]
+                    trend_end_ts = window_samples[-1][0]
+                    increasing_samples = increasing
+                    total_samples = len(window_samples) - 1
+                    break  # Found a matching window
+    
+    # MODE B: Post-landing backup detection
+    post_landing_detected = False
+    final_distance = None
+    landed_at_origin = False
+    
+    # Check if last point indicates landing (speed < 30 kts or very low altitude)
+    last_point = points[-1]
+    is_landed = (last_point.gspeed or 999) < 30 or (last_point.alt or 999) < 1000
+    
+    if is_landed:
+        final_distance = haversine_nm(last_point.lat, last_point.lon, dest_lat, dest_lon)
+        
+        # Check if landed at origin (RTB)
+        if origin:
+            origin_airport = AIRPORT_BY_CODE.get(origin.upper())
+            if origin_airport:
+                dist_to_origin = haversine_nm(last_point.lat, last_point.lon, origin_airport.lat, origin_airport.lon)
+                if dist_to_origin < 10.0:  # Within 10 NM of origin
+                    landed_at_origin = True
+        
+        # Trigger if: final distance > 20 NM AND not at origin
+        if final_distance > DTD_POST_LANDING_MIN_DIST_NM and not landed_at_origin:
+            post_landing_detected = True
+    
+    # Determine if rule matched
+    matched = trend_detected or post_landing_detected
+    
+    if not matched:
+        summary = "No diversion detected"
+        details = {
+            "passed_fl180": passed_fl180,
+            "trend_detected": False,
+            "post_landing_detected": False
+        }
+        return RuleResult(15, False, summary, details)
+    
+    # Build summary and details
+    if trend_detected and post_landing_detected:
+        summary = f"Diversion detected: Real-time trend + landed {final_distance:.1f} NM from destination"
+    elif trend_detected:
+        summary = f"Diversion detected: 5-min consistent distancing trend ({increasing_samples}/{total_samples} samples increasing)"
+    else:
+        summary = f"Diversion detected: Landed {final_distance:.1f} NM from planned destination"
+    
+    details = {
+        "destination_code": destination,
+        "origin_code": origin,
+        "passed_fl180": passed_fl180,
+        "trend_detected": trend_detected,
+        "post_landing_detected": post_landing_detected
+    }
+    
+    if trend_detected:
+        details.update({
+            "trend_start_ts": trend_start_ts,
+            "trend_end_ts": trend_end_ts,
+            "trend_duration_sec": trend_end_ts - trend_start_ts if trend_end_ts else 0,
+            "increasing_samples": increasing_samples,
+            "total_samples": total_samples,
+            "increasing_ratio": round(increasing_samples / total_samples, 3) if total_samples > 0 else 0
+        })
+    
+    if post_landing_detected:
+        details.update({
+            "final_distance_nm": round(final_distance, 2),
+            "landed_at_origin": landed_at_origin,
+            "final_lat": last_point.lat,
+            "final_lon": last_point.lon
+        })
+    
+    return RuleResult(15, True, summary, details)
+
+
+def _rule_performance_mismatch(ctx: RuleContext) -> RuleResult:
+    """
+    Detect performance mismatch (Rule 16) - turn rate exceeds physical limits.
+    
+    This rule identifies contradictions between declared aircraft identity and actual turn rate,
+    using the aircraft database as a physical "truth ruler".
+    
+    Logic:
+    1. Look up aircraft_type in ACD CSV -> get FAA_Weight
+    2. Calculate turn rate (deg/sec) between consecutive points
+    3. Determine threshold based on altitude and weight:
+       - Below 10,000 ft: 4.0 deg/sec (all types)
+       - 10,000-25,000 ft (transition): linear interpolation based on weight
+       - Above 25,000 ft (cruise): Heavy=1.5, Large=2.0, Small=3.5
+    4. Flag if turn rate exceeds threshold for min_consecutive_seconds
+    """
+    points = ctx.track.sorted_points()
+    if not points or len(points) < 2:
+        return RuleResult(16, False, "Insufficient track data", {})
+    
+    # Check if aircraft_type is available
+    if not ctx.metadata or not ctx.metadata.aircraft_type:
+        return RuleResult(16, False, "Aircraft type not available", {})
+    
+    aircraft_type = ctx.metadata.aircraft_type.upper()
+    
+    # Look up aircraft in database
+    acd_db = _load_aircraft_database()
+    if aircraft_type not in acd_db:
+        return RuleResult(16, False, f"Aircraft type {aircraft_type} not found in database", 
+                         {"aircraft_type": aircraft_type})
+    
+    aircraft_info = acd_db[aircraft_type]
+    faa_weight = aircraft_info['FAA_Weight']
+    
+    # Determine weight category for thresholds
+    if 'Heavy' in faa_weight or 'Super' in faa_weight:
+        weight_category = 'Heavy'
+        cruise_threshold = PERF_CRUISE_HEAVY_THRESHOLD
+        transition_gradient = 0.000166  # (4.0 - 1.5) / 15000
+    elif 'Large' in faa_weight:
+        weight_category = 'Large'
+        cruise_threshold = PERF_CRUISE_LARGE_THRESHOLD
+        transition_gradient = 0.000133  # (4.0 - 2.0) / 15000
+    else:  # Small, Small+, Light, Medium, etc.
+        weight_category = 'Small'
+        cruise_threshold = PERF_CRUISE_SMALL_THRESHOLD
+        transition_gradient = 0.000033  # (4.0 - 3.5) / 15000
+    
+    # Track violations - use windowed approach to handle circular patterns
+    violations = []
+    max_turn_rate = 0.0
+    max_turn_point_idx = -1
+    
+    for i in range(1, len(points)):
+        p_prev = points[i - 1]
+        p_curr = points[i]
+        
+        # Skip if heading not available
+        if p_prev.track is None or p_curr.track is None:
+            continue
+        
+        # Skip if speed too low (likely taxiing or stationary)
+        if (p_curr.gspeed or 0) < PERF_MIN_SPEED_KTS:
+            continue
+        
+        # Calculate time delta
+        time_delta = p_curr.timestamp - p_prev.timestamp
+        if time_delta <= 0:
+            continue
+        
+        # Calculate heading change (normalize to -180 to +180)
+        heading_delta = p_curr.track - p_prev.track
+        if heading_delta > 180:
+            heading_delta -= 360
+        elif heading_delta < -180:
+            heading_delta += 360
+        
+        # Calculate turn rate (deg/sec)
+        turn_rate = abs(heading_delta) / time_delta
+        
+        # Track maximum turn rate
+        if turn_rate > max_turn_rate:
+            max_turn_rate = turn_rate
+            max_turn_point_idx = i
+        
+        # Determine threshold based on altitude
+        altitude = p_curr.alt or 0
+        
+        if altitude < PERF_TRANSITION_FLOOR:
+            # Approach layer: 4.0 deg/sec for all
+            threshold = PERF_APPROACH_THRESHOLD
+        elif altitude > PERF_TRANSITION_CEILING:
+            # Cruise layer: weight-specific
+            threshold = cruise_threshold
+        else:
+            # Transition layer: linear interpolation
+            alt_above_floor = altitude - PERF_TRANSITION_FLOOR
+            threshold = PERF_APPROACH_THRESHOLD - (alt_above_floor * transition_gradient)
+        
+        # Check if violation
+        if turn_rate > threshold:
+            violations.append({
+                "timestamp": p_curr.timestamp,
+                "turn_rate": round(turn_rate, 2),
+                "threshold": round(threshold, 2),
+                "altitude": altitude,
+                "exceedance_pct": round((turn_rate - threshold) / threshold * 100, 1),
+                "lat": p_curr.lat,
+                "lon": p_curr.lon
+            })
+    
+    # NEW LOGIC: Check if we have multiple violations within a reasonable time window
+    # This handles circular patterns where turn rate fluctuates
+    matched = False
+    if len(violations) >= 3:
+        # Sort violations by timestamp
+        violations.sort(key=lambda v: v['timestamp'])
+        
+        # Find the longest span where we have at least 3 violations
+        max_window_duration = 0
+        window_violation_count = 0
+        
+        for i in range(len(violations)):
+            # Look ahead for violations within 120 seconds (2 minutes - reasonable for circular pattern)
+            window_start = violations[i]['timestamp']
+            window_end = window_start + 120
+            
+            # Count violations in this window
+            count = sum(1 for v in violations[i:] if v['timestamp'] <= window_end)
+            window_duration = min(violations[i + count - 1]['timestamp'] - window_start, 120) if count > i else 0
+            
+            if count >= 3 and window_duration > max_window_duration:
+                max_window_duration = window_duration
+                window_violation_count = count
+        
+        # Trigger if we have 3+ violations in a 120-second window
+        if window_violation_count >= 3 and max_window_duration >= PERF_MIN_CONSECUTIVE_SEC:
+            matched = True
+    
+    if matched:
+        summary = f"Turn rate anomaly: {aircraft_type} ({weight_category}) exceeded physical limits - max {max_turn_rate:.2f} deg/sec"
+        details = {
+            "aircraft_type": aircraft_type,
+            "faa_weight": faa_weight,
+            "weight_category": weight_category,
+            "cruise_threshold": cruise_threshold,
+            "max_turn_rate": round(max_turn_rate, 2),
+            "violation_count": len(violations),
+            "window_duration_sec": round(max_window_duration, 1),
+            "window_violation_count": window_violation_count,
+            "violations": violations[:10] if len(violations) > 10 else violations  # Limit to first 10
+        }
+        
+        if max_turn_point_idx >= 0:
+            max_point = points[max_turn_point_idx]
+            details.update({
+                "max_turn_lat": max_point.lat,
+                "max_turn_lon": max_point.lon,
+                "max_turn_altitude": max_point.alt
+            })
+        
+        return RuleResult(16, True, summary, details)
+    else:
+        return RuleResult(16, False, "No sustained turn rate violations", {
+            "aircraft_type": aircraft_type,
+            "weight_category": weight_category,
+            "max_turn_rate": round(max_turn_rate, 2),
+            "cruise_threshold": cruise_threshold,
+            "violation_count": len(violations)
+        })
+
+
+def _rule_identity_mismatch_pim(ctx: RuleContext) -> RuleResult:
+    """
+    Detect Performance & Identity Mismatch (Rule 17 - PIM).
+    
+    This rule identifies contradictions between declared aircraft identity and actual
+    speed/climb performance, using the aircraft database as a physical "truth ruler".
+    
+    Logic:
+    1. Look up aircraft_type -> get FAA_Weight + Physical_Class_Engine
+    2. Classify into performance category (Light/Commercial/Heavy/Rotorcraft)
+    3. Check if GS or VR exceeds category threshold
+    4. Trigger if >= 30 consecutive seconds of exceedance
+    5. Military manufacturer check: known military ICAO with civilian callsign
+    6. Emitter Category 6 check: stub (not available in current pipeline)
+    """
+    points = ctx.track.sorted_points()
+    if not points:
+        return RuleResult(17, False, "No track data", {})
+    
+    # Check if aircraft_type is available
+    if not ctx.metadata or not ctx.metadata.aircraft_type:
+        return RuleResult(17, False, "Aircraft type not available", {})
+    
+    aircraft_type = ctx.metadata.aircraft_type.upper()
+    
+    # Look up aircraft in database
+    acd_db = _load_aircraft_database()
+    if aircraft_type not in acd_db:
+        return RuleResult(17, False, f"Aircraft type {aircraft_type} not found in database", 
+                         {"aircraft_type": aircraft_type})
+    
+    aircraft_info = acd_db[aircraft_type]
+    faa_weight = aircraft_info['FAA_Weight']
+    physical_class_engine = aircraft_info['Physical_Class_Engine']
+    manufacturer = aircraft_info['Manufacturer']
+    
+    # Military manufacturer check (immediate alert)
+    callsign = points[0].callsign if points[0].callsign else ""
+    if aircraft_type in PIM_MILITARY_ICAO_CODES:
+        # Check if callsign looks civilian (not military prefix)
+        # Military callsigns typically start with specific patterns (e.g., IAF, USN, etc.)
+        # For simplicity, if it's a known military aircraft ICAO but callsign doesn't suggest military, flag it
+        military_prefixes = ['IAF', 'USN', 'USAF', 'RAF', 'RCH', 'CNV', 'NAVY', 'ARMY', 'AIR', 'MIL']
+        is_military_callsign = any(callsign.upper().startswith(prefix) for prefix in military_prefixes)
+        
+        if not is_military_callsign and callsign:
+            summary = f"Military aircraft under civilian identity: {aircraft_type} with callsign {callsign}"
+            details = {
+                "aircraft_type": aircraft_type,
+                "callsign": callsign,
+                "manufacturer": manufacturer,
+                "alert_type": "military_manufacturer_civilian_callsign",
+                "military_icao_codes": list(PIM_MILITARY_ICAO_CODES)
+            }
+            return RuleResult(17, True, summary, details)
+    
+    # Classify into performance category
+    if 'Turboshaft' in physical_class_engine:
+        category = 'Rotorcraft'
+        max_speed = PIM_ROTORCRAFT_MAX_SPEED
+        max_climb_fpm = PIM_ROTORCRAFT_MAX_CLIMB
+    elif 'Small' in faa_weight:
+        category = 'Light'
+        max_speed = PIM_LIGHT_MAX_SPEED
+        max_climb_fpm = PIM_LIGHT_MAX_CLIMB
+    elif faa_weight in ['Heavy', 'Super']:
+        category = 'Heavy'
+        max_speed = PIM_HEAVY_MAX_SPEED_10K  # Below 10k ft
+        max_climb_fpm = PIM_HEAVY_MAX_CLIMB
+    elif faa_weight == 'Large' and physical_class_engine in ['Jet', 'Turboprop']:
+        category = 'Commercial/Medium'
+        max_speed = PIM_COMMERCIAL_MAX_SPEED_10K  # Below 10k ft
+        max_climb_fpm = PIM_COMMERCIAL_MAX_CLIMB
+    else:
+        # Default to Light category for unknown
+        category = 'Light'
+        max_speed = PIM_LIGHT_MAX_SPEED
+        max_climb_fpm = PIM_LIGHT_MAX_CLIMB
+    
+    # Track violations
+    violations = []
+    consecutive_violation_start = None
+    consecutive_violation_duration = 0
+    max_speed_violation = 0.0
+    max_climb_violation = 0.0
+    
+    for i, p in enumerate(points):
+        # Skip if essential data missing
+        if p.gspeed is None and p.vspeed is None:
+            consecutive_violation_start = None
+            consecutive_violation_duration = 0
+            continue
+        
+        # Check speed violation
+        speed_violation = False
+        climb_violation = False
+        
+        if p.gspeed is not None:
+            # For Commercial/Heavy, only check speed below 10,000 ft
+            if category in ['Commercial/Medium', 'Heavy']:
+                if (p.alt or 0) < PIM_BELOW_10K_FT and p.gspeed > max_speed:
+                    speed_violation = True
+                    max_speed_violation = max(max_speed_violation, p.gspeed)
+            else:
+                # For Light/Rotorcraft, check at all altitudes
+                if p.gspeed > max_speed:
+                    speed_violation = True
+                    max_speed_violation = max(max_speed_violation, p.gspeed)
+        
+        # Check climb rate violation (vspeed in ft/min typically, but might be ft/sec - assume ft/min)
+        if p.vspeed is not None:
+            vspeed_fpm = abs(p.vspeed)  # Take absolute value for climb rate
+            if vspeed_fpm > max_climb_fpm:
+                climb_violation = True
+                max_climb_violation = max(max_climb_violation, vspeed_fpm)
+        
+        # Track consecutive violations
+        if speed_violation or climb_violation:
+            if consecutive_violation_start is None:
+                consecutive_violation_start = p.timestamp
+            consecutive_violation_duration = p.timestamp - consecutive_violation_start
+            
+            violations.append({
+                "timestamp": p.timestamp,
+                "speed_kts": p.gspeed,
+                "climb_fpm": p.vspeed,
+                "altitude": p.alt,
+                "speed_violation": speed_violation,
+                "climb_violation": climb_violation,
+                "lat": p.lat,
+                "lon": p.lon
+            })
+        else:
+            consecutive_violation_start = None
+            consecutive_violation_duration = 0
+    
+    # Determine if rule matched (need >= 30 consecutive seconds)
+    if consecutive_violation_duration >= PIM_CONSECUTIVE_SEC:
+        violation_types = []
+        if max_speed_violation > 0:
+            violation_types.append(f"speed {max_speed_violation:.0f} kts > {max_speed:.0f} kts")
+        if max_climb_violation > 0:
+            violation_types.append(f"climb {max_climb_violation:.0f} fpm > {max_climb_fpm:.0f} fpm")
+        
+        summary = f"Identity spoofing suspected: {aircraft_type} ({category}) exceeded physical limits - {', '.join(violation_types)}"
+        details = {
+            "aircraft_type": aircraft_type,
+            "faa_weight": faa_weight,
+            "physical_class_engine": physical_class_engine,
+            "category": category,
+            "max_speed_threshold": max_speed,
+            "max_climb_threshold": max_climb_fpm,
+            "max_speed_observed": round(max_speed_violation, 1),
+            "max_climb_observed": round(max_climb_violation, 1),
+            "violation_count": len(violations),
+            "consecutive_duration_sec": round(consecutive_violation_duration, 1),
+            "callsign": callsign,
+            "violations": violations[:10] if len(violations) > 10 else violations  # Limit to first 10
+        }
+        
+        return RuleResult(17, True, summary, details)
+    else:
+        return RuleResult(17, False, "No sustained performance violations", {
+            "aircraft_type": aircraft_type,
+            "category": category,
+            "max_speed_threshold": max_speed,
+            "max_climb_threshold": max_climb_fpm,
+            "max_speed_observed": round(max_speed_violation, 1) if max_speed_violation > 0 else 0,
+            "max_climb_observed": round(max_climb_violation, 1) if max_climb_violation > 0 else 0
+        })

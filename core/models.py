@@ -37,7 +37,14 @@ class FlightMetadata:
     origin: Optional[str] = None  # Origin airport code (e.g., "LLBG")
     planned_destination: Optional[str] = None
     planned_route: Optional[List[List[float]]] = None  # [[lat, lon], ...]
-
+    # Additional fields for new rules:
+    category: Optional[str] = None  # FR24 category (e.g., "passenger", "cargo", "Military_and_government")
+    dest_lat: Optional[float] = None  # Destination airport latitude
+    dest_lon: Optional[float] = None  # Destination airport longitude
+    aircraft_type: Optional[str] = None  # ICAO type code (e.g., "A320", "B738")
+    icao_hex: Optional[str] = None  # ICAO 24-bit address / hex code (e.g., "738065")
+    aircraft_registration: Optional[str] = None  # Aircraft registration (e.g., "4X-EKA")
+    callsign: Optional[str] = None  # Callsign from FR24 (e.g., "ELY001")
 
 @dataclass
 class RuleContext:

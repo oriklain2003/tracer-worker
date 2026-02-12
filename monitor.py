@@ -256,7 +256,7 @@ class FlightMetadataCalculator:
     }
     
     @staticmethod
-    def calculate(flight: FlightTrack, fr24_summary: Optional[Dict] = None) -> Dict:
+    def calculate(flight: FlightTrack, fr24_summary: Optional[Dict] = None, icao_hex: Optional[str] = None) -> Dict:
         """Calculate all metadata for a flight."""
         points = flight.sorted_points()
         if not points:
@@ -465,6 +465,11 @@ class FlightMetadataCalculator:
             if not airline_code:
                 airline_code = fallback_airline_code
         
+        # Extract hex from FR24 summary if not passed explicitly
+        hex_code = icao_hex
+        if not hex_code and fr24_summary:
+            hex_code = fr24_summary.get("hex")
+        
         return {
             'flight_id': flight.flight_id,
             'callsign': callsign,
@@ -474,6 +479,7 @@ class FlightMetadataCalculator:
             'aircraft_type': aircraft_type,
             'aircraft_model': aircraft_model,
             'aircraft_registration': aircraft_registration,
+            'icao_hex': hex_code,
             'origin_airport': origin_airport_code,
             'origin_lat': origin_airport_data['lat'] if origin_airport_data else start_lat,
             'origin_lon': origin_airport_data['lon'] if origin_airport_data else start_lon,
@@ -571,6 +577,7 @@ class FlightState:
         self.was_anomaly = False  # Track if previously flagged as anomaly
         self.fr24_summary: Optional[Dict] = None  # FR24 summary data for metadata
         self.full_track_loaded = False  # Track if we've loaded the full historical track
+        self.icao_hex: Optional[str] = None  # ICAO 24-bit hex address from FR24
 
     def add_point(self, point: TrackPoint):
         """Add a new point if timestamp is newer than the last one."""
@@ -740,6 +747,12 @@ class RealtimeMonitor:
             
             # Add current position to state
             state = self.active_flights[flight_id]
+            
+            # Capture hex code (ICAO 24-bit address) from FR24 live data
+            if item.get("hex") and not state.icao_hex:
+                state.icao_hex = item["hex"]
+                logger.debug(f"Captured hex {state.icao_hex} for {flight_id}")
+            
             self._add_position_point(state, item)
         
         self.last_discovery_scan = time.time()
@@ -774,6 +787,11 @@ class RealtimeMonitor:
             # Only update tracked flights - ignore new ones until next discovery scan
             if flight_id in self.active_flights:
                 state = self.active_flights[flight_id]
+                
+                # Capture hex code if not yet captured
+                if item.get("hex") and not state.icao_hex:
+                    state.icao_hex = item["hex"]
+                
                 self._add_position_point(state, item)
                 updated_count += 1
         
@@ -840,8 +858,13 @@ class RealtimeMonitor:
                     origin = fr24_sum.get("orig_icao") or fr24_sum.get("origin_icao") or fr24_sum.get("schd_from")
                     dest = fr24_sum.get("dest_icao") or fr24_sum.get("destination_icao") or fr24_sum.get("schd_to")
                     
+                    # Capture hex code from summary if not already set
+                    hex_code = fr24_sum.get("hex")
+                    if hex_code and not self.active_flights[flight_id].icao_hex:
+                        self.active_flights[flight_id].icao_hex = hex_code
+                    
                     logger.info(f"📋 Loaded summary for {flight_id}: {callsign} | {flight_number} | "
-                               f"{aircraft_type} ({aircraft_reg}) | {origin}→{dest}")
+                               f"{aircraft_type} ({aircraft_reg}) | {origin}→{dest} | hex={hex_code}")
         except Exception as e:
             logger.debug(f"Could not fetch summary for {flight_id}: {e}")
     
@@ -909,14 +932,22 @@ class RealtimeMonitor:
                         track = state.to_flight_track()
                         
                         # Calculate comprehensive metadata dict with FR24 summary
-                        metadata_dict = FlightMetadataCalculator.calculate(track, fr24_summary=state.fr24_summary)
+                        metadata_dict = FlightMetadataCalculator.calculate(
+                            track, fr24_summary=state.fr24_summary, icao_hex=state.icao_hex
+                        )
                         
                         # Convert dict to FlightMetadata object for rule engine
-                        # The rule engine only needs origin, destination, and route
+                        # The rule engine needs origin, destination, route, hex, and more
                         metadata_obj = FlightMetadata(
-                            origin=metadata_dict.get('origin_airport'),
-                            planned_destination=metadata_dict.get('destination_airport'),
-                            planned_route=None  # Could extract from dict if available
+                                origin=metadata_dict.get('origin_airport'),
+                                planned_destination=metadata_dict.get('destination_airport'),
+                                category=metadata_dict.get('category'),
+                                dest_lat=metadata_dict.get('dest_lat'),
+                                dest_lon=metadata_dict.get('dest_lon'),
+                                aircraft_type=metadata_dict.get('aircraft_type'),
+                                icao_hex=metadata_dict.get('icao_hex'),
+                                aircraft_registration=metadata_dict.get('aircraft_registration'),
+                                callsign=metadata_dict.get('callsign'),
                         )
                         
                         # Run analysis with FlightMetadata object

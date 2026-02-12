@@ -42,8 +42,13 @@ def load_metadata(path: Path | None) -> FlightMetadata | None:
     with path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
     return FlightMetadata(
+        origin=raw.get("origin"),
         planned_destination=raw.get("planned_destination"),
         planned_route=raw.get("planned_route"),
+        category=raw.get("category"),
+        dest_lat=raw.get("dest_lat"),
+        dest_lon=raw.get("dest_lon"),
+        aircraft_type=raw.get("aircraft_type")
     )
 
 

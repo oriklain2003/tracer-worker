@@ -57,7 +57,7 @@
     },
     "proximity": {
       "distance_nm": 4,
-      "altitude_ft": 999,
+      "altitude_ft": 980,
       "time_window_seconds": 7,
       "airport_exclusion_nm": 4
     },
@@ -73,7 +73,7 @@
       "near_airport_nm": 10,
       "takeoff_alt_ft": 750,
       "landing_alt_ft": 800,
-      "time_limit_seconds": 600,
+      "time_limit_seconds": 999999999999,
       "min_outbound_nm": 3,
       "min_elapsed_seconds": 120
     },
@@ -89,8 +89,6 @@
       "repeat_count": 2
     },
     "path_learning": {
-      "tube_altitude_tolerance_ft": 60000.0,
-
       "paths_file": "rules/path_library_v2.json",
       "heatmap_file": "rules/flight_heatmap_v2.npy",
       "num_samples": 120,
@@ -99,11 +97,13 @@
       "heatmap_cell_deg": 0.05,
       "heatmap_threshold": 5,
       "min_off_course_points": 15,
+      "min_altitude_ft": 9000,
       "emerging_distance_nm": 12.0,
       "emerging_bucket_size": 5,
       "emerging_similarity_deg": 30,
       "default_width_nm": 8.0,
-      "tube_lateral_tolerance_nm": 20.0
+      "tube_lateral_tolerance_nm": 20.0,
+      "tube_altitude_tolerance_ft": 60000.0
     },
     "unplanned_israel_landing": {
       "near_airport_nm": 5
@@ -121,6 +121,90 @@
     "military_aircraft": {
       "enabled": true,
       "description": "Detects military aircraft by callsign and registration patterns"
+    },
+    "circular_flight": {
+      "min_duration_seconds": 900,
+      "max_circle_closure_nm": 8.0,
+      "min_off_route_ratio": 0.6,
+      "min_altitude_ft": 5000,
+      "non_commercial_categories": ["Military_and_government", "General_aviation", "Ultralight", "Glider", "UAV"]
+    },
+    "distance_trend_diversion": {
+      "check_window_seconds": 300,
+      "sample_interval_seconds": 10,
+      "min_increasing_ratio": 0.8,
+      "min_cruise_altitude_ft": 18000,
+      "post_landing_min_distance_nm": 20.0
+    },
+    "performance_mismatch": {
+      "aircraft_data_csv": "docs/aircraft_data.csv",
+      "approach_threshold_deg_sec": 4.0,
+      "cruise_heavy_threshold_deg_sec": 1.5,
+      "cruise_large_threshold_deg_sec": 2.0,
+      "cruise_small_threshold_deg_sec": 3.5,
+      "transition_floor_ft": 10000,
+      "transition_ceiling_ft": 25000,
+      "min_consecutive_seconds": 5,
+      "min_speed_kts": 100
+    },
+    "identity_mismatch_pim": {
+      "consecutive_seconds": 30,
+      "light_max_speed_kts": 220,
+      "light_max_climb_fpm": 2500,
+      "commercial_max_speed_below_10k_kts": 350,
+      "commercial_max_climb_fpm": 5500,
+      "heavy_max_speed_below_10k_kts": 350,
+      "heavy_max_climb_fpm": 5500,
+      "rotorcraft_max_speed_kts": 200,
+      "rotorcraft_max_climb_fpm": 3500,
+      "below_10k_ft": 10000,
+      "military_icao_codes": ["A10", "B2", "B52", "C17", "C130", "C30J", "F15", "F16", "F18H", "F18S", "F22", "K35R", "P3", "P8", "T38", "V22", "HAWK"]
+    },
+    "endurance_breach": {
+      "alert_multiplier": 1.2,
+      "max_endurance_hours": {
+        "C172": 5.0,
+        "C182": 5.5,
+        "C208": 5.0,
+        "PA28": 4.5,
+        "PA46": 6.0,
+        "B350": 5.0,
+        "PC12": 5.5,
+        "A320": 6.5,
+        "A321": 7.0,
+        "A319": 6.0,
+        "B737": 6.5,
+        "B738": 7.0,
+        "B739": 7.5,
+        "E190": 5.5,
+        "CRJ9": 4.5,
+        "A332": 13.0,
+        "A333": 13.5,
+        "A359": 16.0,
+        "B772": 15.0,
+        "B77W": 17.0,
+        "B788": 15.5,
+        "B789": 16.0,
+        "B744": 16.0,
+        "B748": 17.5,
+        "A388": 18.0,
+        "C130": 8.0,
+        "C17": 10.0,
+        "P3": 12.0,
+        "UAV": 24.0
+      }
+    },
+    "signal_discontinuity": {
+      "min_gap_seconds": 180,
+      "min_altitude_ft": 3000,
+      "min_speed_kts": 120,
+      "min_airport_distance_nm": 15.0,
+      "stability_window_seconds": 180,
+      "stability_deviation_ratio": 0.05
+    },
+    "commercial_footprint_absence": {
+      "min_weight_categories": ["Heavy", "Large"],
+      "military_callsign_prefixes": ["MIL", "IAF", "USN", "USA", "RAF", "RCH", "CNV", "NAV", "ARM", "AIR"]
     }
   }
 }

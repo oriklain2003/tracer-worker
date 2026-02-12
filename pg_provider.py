@@ -215,11 +215,20 @@ def save_flight_metadata(metadata: Dict, schema: str = 'live') -> bool:
                 
                 cursor.execute(delete_query, (metadata['flight_id'],))
                 
+                # Ensure icao_hex column exists (safe migration)
+                try:
+                    cursor.execute(sql.SQL("""
+                        ALTER TABLE {}.flight_metadata ADD COLUMN IF NOT EXISTS icao_hex TEXT
+                    """).format(sql.Identifier(schema)))
+                except Exception:
+                    pass  # Column may already exist or ALTER not supported in this context
+                
                 # Now insert the new metadata
                 insert_query = sql.SQL("""
                     INSERT INTO {}.flight_metadata (
                         flight_id, callsign, flight_number, airline, airline_code,
                         aircraft_type, aircraft_model, aircraft_registration,
+                        icao_hex,
                         origin_airport, origin_lat, origin_lon,
                         destination_airport, dest_lat, dest_lon,
                         first_seen_ts, last_seen_ts, scheduled_departure, scheduled_arrival,
@@ -234,7 +243,7 @@ def save_flight_metadata(metadata: Dict, schema: str = 'live') -> bool:
                         created_at, updated_at, category
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                 """).format(sql.Identifier(schema))
                 
@@ -243,6 +252,7 @@ def save_flight_metadata(metadata: Dict, schema: str = 'live') -> bool:
                     metadata.get('airline'), metadata.get('airline_code'),
                     metadata.get('aircraft_type'), metadata.get('aircraft_model'), 
                     metadata.get('aircraft_registration'),
+                    metadata.get('icao_hex'),
                     metadata.get('origin_airport'), metadata.get('origin_lat'), metadata.get('origin_lon'),
                     metadata.get('destination_airport'), metadata.get('dest_lat'), metadata.get('dest_lon'),
                     metadata.get('first_seen_ts'), metadata.get('last_seen_ts'),
